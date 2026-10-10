@@ -1,0 +1,41 @@
+# Build artifacts (gateway.exe in bin/ is committed for instant run, but rebuilds ignored)
+bin/gateway.exe~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Go
+*.exe~
+# Local Go build cache
+vendor/
+
+# Logs
+logs/
+*.out.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Go workspace files (when developing locally)
+go.work
+go.work.sum
+
+# Test artifacts
+*.test
+*.out

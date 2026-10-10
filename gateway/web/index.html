@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>共享算力 · 总控面板</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⚡</span>
+    <span class="title">共享算力</span>
+    <span class="subtitle">内网分布式算力调度</span>
+  </div>
+  <div class="status" id="conn-status">
+    <span class="dot"></span>
+    <span class="label">连接中...</span>
+  </div>
+</header>
+
+<main class="container">
+  <section class="kpis">
+    <div class="kpi">
+      <div class="kpi-value" id="kpi-workers">0</div>
+      <div class="kpi-label">在线节点</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-value" id="kpi-running">0</div>
+      <div class="kpi-label">运行中任务</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-value" id="kpi-done">0</div>
+      <div class="kpi-label">累计完成</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-value" id="kpi-failed">0</div>
+      <div class="kpi-label">失败任务</div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>📡 算力节点</h2>
+    <div class="grid" id="workers-grid">
+      <div class="empty">暂无在线节点，请先启动 worker</div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>📋 任务列表</h2>
+    <div class="task-filters">
+      <button class="filter active" data-filter="all">全部</button>
+      <button class="filter" data-filter="running">运行中</button>
+      <button class="filter" data-filter="done">已完成</button>
+      <button class="filter" data-filter="failed">失败</button>
+      <button class="filter" data-filter="pending">等待中</button>
+    </div>
+    <div class="task-list" id="task-list">
+      <div class="empty">暂无任务</div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>🚀 下发任务</h2>
+    <form id="task-form" class="task-form">
+      <div class="form-row">
+        <label>任务类型</label>
+        <select id="task-type" name="type">
+          <optgroup label="代码算力">
+            <option value="code_format">代码格式化 (code_format)</option>
+            <option value="code_ast">AST 静态分析 (code_ast)</option>
+          </optgroup>
+          <optgroup label="文档算力">
+            <option value="doc_summary">文本摘要 (doc_summary)</option>
+            <option value="doc_wordfreq">词频统计 (doc_wordfreq)</option>
+          </optgroup>
+          <optgroup label="CSV 算力">
+            <option value="csv_montecarlo">蒙特卡洛模拟 (csv_montecarlo)</option>
+            <option value="csv_stats">描述统计 (csv_stats)</option>
+          </optgroup>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Payload</label>
+        <textarea id="task-payload" name="payload" rows="5" placeholder="任务内容。示例：&#10;def f(x):&#10;  return x*2"></textarea>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn-primary">下发到最优节点</button>
+        <button type="button" class="btn-secondary" id="load-template">载入模板</button>
+      </div>
+      <div class="form-hint">网关会根据 CPU/内存/队列长度评分，自动选择最合适的节点</div>
+    </form>
+  </section>
+</main>
+
+<template id="worker-card-tpl">
+  <div class="worker-card" data-status="online">
+    <div class="worker-head">
+      <span class="worker-name"></span>
+      <span class="worker-type"></span>
+      <span class="worker-status">online</span>
+    </div>
+    <div class="worker-cpu"></div>
+    <div class="meter">
+      <span class="meter-label">CPU</span>
+      <div class="meter-bar"><div class="meter-fill meter-cpu"></div></div>
+      <span class="meter-value meter-cpu-v">0%</span>
+    </div>
+    <div class="meter">
+      <span class="meter-label">内存</span>
+      <div class="meter-bar"><div class="meter-fill meter-mem"></div></div>
+      <span class="meter-value meter-mem-v">0%</span>
+    </div>
+    <div class="worker-foot">
+      <span>队列: <b class="worker-queue">0</b></span>
+      <span>完成: <b class="worker-done">0</b></span>
+    </div>
+  </div>
+</template>
+
+<template id="task-item-tpl">
+  <div class="task-item" data-status="pending">
+    <div class="task-head">
+      <span class="task-type"></span>
+      <span class="task-status">pending</span>
+      <span class="task-time"></span>
+      <span class="task-toggle">▾</span>
+    </div>
+    <div class="task-progress-wrap">
+      <div class="task-progress-bar"><div class="task-progress-fill"></div></div>
+      <span class="task-progress-val">0%</span>
+    </div>
+    <div class="task-body" hidden>
+      <div class="task-section">
+        <div class="task-section-title">Payload</div>
+        <pre class="task-payload"></pre>
+      </div>
+      <div class="task-section">
+        <div class="task-section-title">日志</div>
+        <pre class="task-logs"></pre>
+      </div>
+      <div class="task-section task-result-section" hidden>
+        <div class="task-section-title">结果</div>
+        <pre class="task-result"></pre>
+      </div>
+      <div class="task-section task-error-section" hidden>
+        <div class="task-section-title">错误</div>
+        <pre class="task-error"></pre>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
