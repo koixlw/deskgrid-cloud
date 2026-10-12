@@ -23,6 +23,9 @@ logs/
 # Worker output artifacts (PNG / WAV / MP4 generated at runtime)
 artifacts/
 
+# Gateway persistence snapshots (workers.json + tasks.json written by gateway)
+data/
+
 # IDE
 .vscode/
 .idea/

@@ -21,17 +21,56 @@ var webFS embed.FS
 // audio, and video. Exposed read-only via HTTP at /artifacts/.
 var artifactsDir = envOr("ARTIFACTS_DIR", `E:\deskgrid-cloud\artifacts`)
 
+// dataDir holds the gateway's persistence snapshots (workers.json, tasks.json).
+var dataDir = envOr("GATEWAY_DATA_DIR", "./data")
+
 func main() {
 	logDir := envOr("LOG_DIR", "./logs")
 	internal.InitLogger(logDir)
 
+	// Auth: shared-secret token. Empty = dev mode (no auth).
+	token := envOr("GATEWAY_TOKEN", "")
+	authRequired := internal.AuthRequired(token)
+	if authRequired {
+		internal.Info("auth ENABLED (token set via GATEWAY_TOKEN)")
+	} else {
+		internal.Info("auth DISABLED (GATEWAY_TOKEN unset; dev mode)")
+	}
+
 	store := internal.NewStore()
 	hub := internal.NewHub()
 	internal.SetStoreRef(store)
-	store.SetNotifier(hub.Broadcast)
-	store.StartOfflineSweeper(10*time.Second, 2*time.Second)
 
-	srv := internal.NewServer(store, hub)
+	// Persistence subscribes to store events. Chain hub.Broadcast + persistence
+	// so every state change broadcasts to WS AND is queued for disk flush.
+	persistence := internal.NewPersistence(dataDir, store)
+	hubBroadcast := hub.Broadcast
+	store.SetNotifier(func(event string, payload interface{}) {
+		hubBroadcast(event, payload)
+		persistence.OnEvent(event, payload)
+	})
+	store.StartOfflineSweeper(10*time.Second, 2*time.Second)
+	defer persistence.Stop()
+
+	// Restore previous state from disk, then settle in-flight tasks.
+	if workers, tasks, inFlight := internal.Load(dataDir); len(workers) > 0 || len(tasks) > 0 {
+		internal.Info("persistence: restored %d workers, %d tasks (%d in-flight)", len(workers), len(tasks), len(inFlight))
+		for _, w := range workers {
+			store.AddWorker(w)
+		}
+		for _, t := range tasks {
+			if t.Status == "running" || t.Status == "pending" {
+				continue // in-flight, will be marked failed below
+			}
+			store.AddTask(t)
+		}
+		for _, id := range inFlight {
+			store.FailTaskDirect(id, "gateway restarted; task was in-flight when gateway went down")
+		}
+	}
+	go persistence.Run()
+
+	srv := internal.NewServer(store, hub, token)
 	engine := srv.Engine()
 
 	// serve embedded web/

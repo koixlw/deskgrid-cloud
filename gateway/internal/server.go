@@ -17,17 +17,23 @@ import (
 
 // Server wires HTTP routes to the store + hub.
 type Server struct {
-	store    *Store
-	hub      *Hub
-	engine   *gin.Engine
+	store        *Store
+	hub          *Hub
+	engine       *gin.Engine
+	authRequired bool
 }
 
-func NewServer(store *Store, hub *Hub) *Server {
+func NewServer(store *Store, hub *Hub, token string) *Server {
 	gin.SetMode(gin.ReleaseMode)
-	s := &Server{store: store, hub: hub}
+	s := &Server{
+		store:        store,
+		hub:          hub,
+		authRequired: AuthRequired(token),
+	}
 	s.engine = gin.New()
 	s.engine.Use(gin.Recovery())
 	s.engine.Use(corsMiddleware())
+	s.engine.Use(AuthMiddleware(token))
 	s.routes()
 	return s
 }
@@ -50,6 +56,7 @@ func corsMiddleware() gin.HandlerFunc {
 func (s *Server) routes() {
 	api := s.engine.Group("/api")
 	{
+		api.GET("/auth-check", s.authCheck)
 		api.GET("/workers", s.listWorkers)
 		api.GET("/workers/:id", s.getWorker)
 		api.POST("/workers/register", s.registerWorker)
@@ -201,6 +208,15 @@ func (s *Server) workerResult(c *gin.Context) {
 
 func (s *Server) listWorkers(c *gin.Context) {
 	c.JSON(200, s.store.ListWorkers())
+}
+
+// authCheck reports whether auth is required. This endpoint is public so the
+// panel can decide whether to prompt for a token before making any other call.
+func (s *Server) authCheck(c *gin.Context) {
+	c.JSON(200, gin.H{
+		"required": s.authRequired,
+		"hint":     "set Authorization: Bearer <token> or ?token=<token>",
+	})
 }
 
 func (s *Server) getWorker(c *gin.Context) {

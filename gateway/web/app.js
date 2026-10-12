@@ -5,15 +5,95 @@ const state = {
   expanded: new Set(), // task IDs that are expanded
   filter: 'all',
   ws: null,
+  authToken: null,
+  authRequired: false,
 };
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 
+// ---------- Auth ----------
+function authHeaders() {
+  return state.authToken ? { 'Authorization': `Bearer ${state.authToken}` } : {};
+}
+
+function authUrl(url) {
+  if (!state.authToken) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}token=${encodeURIComponent(state.authToken)}`;
+}
+
+async function authedFetch(url, opts = {}) {
+  const headers = { ...(opts.headers || {}), ...authHeaders() };
+  const r = await fetch(url, { ...opts, headers });
+  if (r.status === 401 && state.authToken) {
+    // token rejected; reset and show banner
+    state.authToken = null;
+    localStorage.removeItem('deskgrid_token');
+    if (state.ws) { try { state.ws.close(); } catch (e) {} state.ws = null; }
+    showAuthBanner();
+    alert('令牌无效，请重新设置');
+  }
+  return r;
+}
+
+async function initAuth() {
+  try {
+    const r = await fetch('/api/auth-check');
+    const d = await r.json();
+    if (!d.required) {
+      state.authRequired = false;
+      hideAuthBanner();
+      return;
+    }
+    state.authRequired = true;
+    showAuthBanner();
+    const stored = localStorage.getItem('deskgrid_token');
+    if (stored) {
+      state.authToken = stored;
+      // verify token works
+      const test = await authedFetch('/api/workers');
+      if (test.ok) {
+        hideAuthBanner();
+        return;
+      }
+      state.authToken = null;
+      localStorage.removeItem('deskgrid_token');
+    }
+  } catch (e) {
+    console.error('auth init failed', e);
+  }
+}
+
+function showAuthBanner() {
+  const el = $('#auth-banner');
+  if (el) el.hidden = false;
+}
+
+function hideAuthBanner() {
+  const el = $('#auth-banner');
+  if (el) el.hidden = true;
+}
+
+$('#auth-set').addEventListener('click', () => {
+  const t = prompt('输入访问令牌：');
+  if (t && t.trim()) {
+    localStorage.setItem('deskgrid_token', t.trim());
+    state.authToken = t.trim();
+    location.reload();
+  }
+});
+
+$('#auth-clear').addEventListener('click', () => {
+  localStorage.removeItem('deskgrid_token');
+  state.authToken = null;
+  location.reload();
+});
+
 // ---------- WebSocket ----------
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = `${proto}//${location.host}/ws`;
+  const url = authUrl(`${proto}//${location.host}/ws`);
   state.ws = new WebSocket(url);
 
   state.ws.onopen = () => {
@@ -143,7 +223,7 @@ function renderWorkers() {
       if (!confirm(`确认删除节点 "${label}" 吗？\n\n远端进程不会停止，仍可能自动重新上线。`)) return;
       delBtn.disabled = true;
       try {
-        const r = await fetch(`/api/workers/${w.id}`, { method: 'DELETE' });
+        const r = await authedFetch(`/api/workers/${w.id}`, { method: 'DELETE' });
         if (!r.ok) {
           const err = await r.json().catch(() => ({}));
           alert(`删除失败: ${err.error || r.status}`);
@@ -279,14 +359,14 @@ function renderMediaFromResult(parsed) {
     if (!url) continue;
     if (k === 'image_path') {
       const img = document.createElement('img');
-      img.src = url;
+      img.src = authUrl(url);
       img.alt = parsed.prompt || 'generated';
       img.className = 'task-media-img';
       wrap.appendChild(img);
       added = true;
     } else if (k === 'audio_path') {
       const a = document.createElement('audio');
-      a.src = url;
+      a.src = authUrl(url);
       a.controls = true;
       a.className = 'task-media-audio';
       wrap.appendChild(a);
@@ -296,7 +376,7 @@ function renderMediaFromResult(parsed) {
   const vurl = toUrl(parsed.video_path);
   if (vurl) {
     const v = document.createElement('video');
-    v.src = vurl;
+    v.src = authUrl(vurl);
     v.controls = true;
     v.className = 'task-media-video';
     wrap.appendChild(v);
@@ -316,7 +396,7 @@ $('#task-form').addEventListener('submit', async (e) => {
   btn.disabled = true;
   btn.textContent = '下发中...';
   try {
-    const r = await fetch('/api/tasks', {
+    const r = await authedFetch('/api/tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type, payload, source: 'panel' }),
@@ -374,8 +454,8 @@ setInterval(async () => {
   if (!state.ws || state.ws.readyState !== 1) {
     try {
       const [wr, tr] = await Promise.all([
-        fetch('/api/workers').then((r) => r.json()),
-        fetch('/api/tasks').then((r) => r.json()),
+        authedFetch('/api/workers').then((r) => r.json()),
+        authedFetch('/api/tasks').then((r) => r.json()),
       ]);
       state.workers.clear();
       state.tasks.clear();
@@ -386,5 +466,9 @@ setInterval(async () => {
   }
 }, 10000);
 
-connect();
-render();
+// ---------- Boot ----------
+(async function () {
+  await initAuth();
+  connect();
+  render();
+})();

@@ -32,6 +32,28 @@ html, body {
   background: #f85149;
   box-shadow: 0 0 8px rgba(248, 81, 73, 0.5);
 }
+
+.auth-banner {
+  background: linear-gradient(135deg, #d29922 0%, #9e6a03 100%);
+  color: white;
+  padding: 8px 16px;
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  align-items: center;
+  font-size: 13px;
+}
+.auth-banner-btn {
+  background: rgba(0, 0, 0, 0.25);
+  color: white;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.auth-banner-btn:hover { background: rgba(0, 0, 0, 0.4); }
+.auth-banner-clear { background: transparent; border-color: rgba(255,255,255,0.3); }
 .status.connected .dot {
   background: #3fb950;
   box-shadow: 0 0 8px rgba(63, 185, 80, 0.5);

@@ -255,6 +255,26 @@ func (s *Store) ListTasks() []*Task {
 	return out
 }
 
+// FailTaskDirect marks a task as failed without bumping worker.TasksDone.
+// Used at gateway restart to settle in-flight tasks whose workers may not
+// still be alive.
+func (s *Store) FailTaskDirect(taskID, errMsg string) {
+	s.mu.Lock()
+	t, ok := s.tasks[taskID]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	t.Status = "failed"
+	t.Error = errMsg
+	t.FinishedAt = time.Now()
+	t.Progress = 100
+	tCopy := *t
+	tCopy.Logs = append([]string{}, t.Logs...)
+	s.mu.Unlock()
+	s.notify("task_done", &tCopy)
+}
+
 // SweepOffline marks workers without heartbeat for >timeout as offline.
 func (s *Store) SweepOffline(timeout time.Duration) {
 	s.mu.RLock()
