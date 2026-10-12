@@ -53,6 +53,7 @@ func (s *Server) routes() {
 		api.GET("/workers", s.listWorkers)
 		api.GET("/workers/:id", s.getWorker)
 		api.POST("/workers/register", s.registerWorker)
+		api.DELETE("/workers/:id", s.deleteWorker)
 		api.POST("/workers/:id/heartbeat", s.heartbeat)
 		api.POST("/workers/:id/progress", s.workerProgress)
 		api.POST("/workers/:id/result", s.workerResult)
@@ -94,8 +95,9 @@ func (s *Server) registerWorker(c *gin.Context) {
 	if req.ID == "" {
 		req.ID = uuid.NewString()
 	}
-	if req.Type == "" || (req.Type != "code" && req.Type != "doc" && req.Type != "csv") {
-		c.JSON(400, gin.H{"error": "type must be code | doc | csv"})
+	if req.Type == "" || (req.Type != "code" && req.Type != "doc" && req.Type != "csv" &&
+		req.Type != "image" && req.Type != "audio" && req.Type != "video") {
+		c.JSON(400, gin.H{"error": "type must be code | doc | csv | image | audio | video"})
 		return
 	}
 	host := c.ClientIP()
@@ -209,6 +211,17 @@ func (s *Server) getWorker(c *gin.Context) {
 		return
 	}
 	c.JSON(200, w)
+}
+
+func (s *Server) deleteWorker(c *gin.Context) {
+	id := c.Param("id")
+	w := s.store.RemoveWorker(id)
+	if w == nil {
+		c.JSON(404, gin.H{"error": "worker not found"})
+		return
+	}
+	Info("worker deleted: id=%s name=%s type=%s", w.ID, w.Name, w.Type)
+	c.JSON(200, gin.H{"ok": true})
 }
 
 // ---------- Task endpoints ----------

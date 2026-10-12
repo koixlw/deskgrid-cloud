@@ -129,6 +129,27 @@ html, body {
   color: white;
 }
 .worker-card[data-status="offline"] .worker-status { background: #6e7681; }
+.worker-delete {
+  background: transparent;
+  border: 1px solid transparent;
+  color: #6e7681;
+  width: 22px; height: 22px;
+  border-radius: 4px;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0;
+  margin-left: 4px;
+  transition: all 0.15s;
+}
+.worker-card:hover .worker-delete { color: #8b949e; }
+.worker-delete:hover {
+  background: #f8514922;
+  border-color: #f8514944;
+  color: #f85149;
+}
+.worker-delete:disabled { opacity: 0.4; cursor: not-allowed; }
 .worker-cpu {
   font-size: 12px;
   color: #8b949e;
@@ -284,6 +305,15 @@ html, body {
   color: #c9d1d9;
 }
 .task-error { color: #f85149; border-color: #f8514944; }
+.task-media { margin-top: 8px; }
+.task-media-img,
+.task-media-video {
+  max-width: 100%;
+  border-radius: 4px;
+  border: 1px solid #30363d;
+  background: #000;
+}
+.task-media-audio { width: 100%; margin-top: 4px; }
 
 .task-form { display: flex; flex-direction: column; gap: 12px; }
 .form-row { display: flex; flex-direction: column; gap: 6px; }

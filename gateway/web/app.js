@@ -68,6 +68,11 @@ function handleEvent(msg) {
       renderWorkers();
       renderKPIs();
       break;
+    case 'worker_deleted':
+      state.workers.delete(payload.id);
+      renderWorkers();
+      renderKPIs();
+      break;
     case 'task_added':
       state.tasks.set(payload.id, payload);
       renderTasks();
@@ -131,6 +136,24 @@ function renderWorkers() {
     setMeter(node.querySelector('.meter-mem'), node.querySelector('.meter-mem-v'), w.mem_usage);
     node.querySelector('.worker-queue').textContent = w.queue_len || 0;
     node.querySelector('.worker-done').textContent = w.tasks_done || 0;
+    const delBtn = node.querySelector('.worker-delete');
+    delBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const label = w.name || w.id.slice(0, 8);
+      if (!confirm(`确认删除节点 "${label}" 吗？\n\n远端进程不会停止，仍可能自动重新上线。`)) return;
+      delBtn.disabled = true;
+      try {
+        const r = await fetch(`/api/workers/${w.id}`, { method: 'DELETE' });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          alert(`删除失败: ${err.error || r.status}`);
+          delBtn.disabled = false;
+        }
+      } catch (err) {
+        alert('请求失败: ' + err.message);
+        delBtn.disabled = false;
+      }
+    });
     grid.appendChild(node);
   });
 }
@@ -184,11 +207,17 @@ function renderTasks() {
     const errorSection = node.querySelector('.task-error-section');
     if (t.status === 'done' && t.result) {
       resultSection.hidden = false;
+      const resultEl = node.querySelector('.task-result');
       try {
         const parsed = JSON.parse(t.result);
-        node.querySelector('.task-result').textContent = JSON.stringify(parsed, null, 2);
+        resultEl.textContent = JSON.stringify(parsed, null, 2);
+        // also render any media referenced in the result
+        const media = renderMediaFromResult(parsed);
+        if (media) {
+          resultEl.parentNode.insertBefore(media, resultEl.nextSibling);
+        }
       } catch (e) {
-        node.querySelector('.task-result').textContent = t.result;
+        resultEl.textContent = t.result;
       }
     }
     if (t.status === 'failed' && t.error) {
@@ -223,6 +252,58 @@ function formatTime(iso) {
 }
 
 // ---------- Form ----------
+// Detect media paths in a parsed task result and produce a preview element.
+function renderMediaFromResult(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const artsDir = 'E:\\deskgrid-cloud\\artifacts\\';
+  const artsDirAlt = 'E:/deskgrid-cloud/artifacts/';
+
+  function toUrl(p) {
+    if (!p) return null;
+    const norm = p.replace(/\\/g, '/');
+    const idx = norm.lastIndexOf('/artifacts/');
+    if (idx >= 0) {
+      return '/artifacts/' + norm.substring(idx + '/artifacts/'.length);
+    }
+    if (norm.includes(artsDirAlt)) {
+      return '/artifacts/' + norm.substring(norm.indexOf(artsDirAlt) + artsDirAlt.length);
+    }
+    return null;
+  }
+
+  const wrap = document.createElement('div');
+  wrap.className = 'task-media';
+  let added = false;
+  for (const k of ['image_path', 'audio_path']) {
+    const url = toUrl(parsed[k]);
+    if (!url) continue;
+    if (k === 'image_path') {
+      const img = document.createElement('img');
+      img.src = url;
+      img.alt = parsed.prompt || 'generated';
+      img.className = 'task-media-img';
+      wrap.appendChild(img);
+      added = true;
+    } else if (k === 'audio_path') {
+      const a = document.createElement('audio');
+      a.src = url;
+      a.controls = true;
+      a.className = 'task-media-audio';
+      wrap.appendChild(a);
+      added = true;
+    }
+  }
+  const vurl = toUrl(parsed.video_path);
+  if (vurl) {
+    const v = document.createElement('video');
+    v.src = vurl;
+    v.controls = true;
+    v.className = 'task-media-video';
+    wrap.appendChild(v);
+    added = true;
+  }
+  return added ? wrap : null;
+}
 $('#task-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const type = $('#task-type').value;
@@ -266,6 +347,15 @@ $('#load-template').addEventListener('click', () => {
     doc_wordfreq: '今天天气很好，今天我们去公园玩。公园里有很多花，很多树，还有很多小朋友在玩耍。今天真开心！',
     csv_montecarlo: '{"samples": 100000, "distribution": "normal", "mean": 0, "stddev": 1}',
     csv_stats: '[1.5, 2.3, 3.7, 4.1, 5.9, 6.2, 7.8, 8.4, 9.0, 10.5, 11.2, 12.8, 13.3, 14.7, 15.1]',
+    image_txt2img: 'a cute orange cat sitting on a wooden floor, soft sunlight',
+    image_img2img: '{"prompt": "oil painting style", "strength": 0.6}',
+    image_inpaint: '{"prompt": "a window with mountains view", "image_path": ""}',
+    image_controlnet: '{"prompt": "character pose reference", "image_path": ""}',
+    audio_tts_line: '今天天气真好，我们一起去公园吧。',
+    audio_tts_with_emotion: '{"text": "The quick brown fox jumps over the lazy dog.", "emotion": "happy"}',
+    video_assemble_clip: '{"scenes": ["开场：朝阳", "发展：主角登场", "高潮：追逐", "结尾：和解"], "fps": 8, "sec_per_scene": 1.5}',
+    video_add_subtitle: '{"scenes": ["Hello", "World"], "fps": 8, "sec_per_scene": 1.5}',
+    video_kenburns: '{"prompt": "ancient castle on a hill", "fps": 12, "duration": 3}',
   };
   $('#task-payload').value = templates[type] || '';
 });

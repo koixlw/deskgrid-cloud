@@ -17,9 +17,12 @@ GATEWAY_EXE = os.path.join(ROOT, "bin", "gateway.exe")
 GATEWAY_URL = "http://127.0.0.1:13000"
 GATEWAY_PORT = 13000
 WORKERS = [
-    ("code", os.path.join(ROOT, "workers", "code", "main.py"), 3001),
-    ("doc",  os.path.join(ROOT, "workers", "doc",  "main.py"), 3002),
-    ("csv",  os.path.join(ROOT, "workers", "csv",  "main.py"), 3003),
+    ("code",  os.path.join(ROOT, "workers", "code",  "main.py"), 3001),
+    ("doc",   os.path.join(ROOT, "workers", "doc",   "main.py"), 3002),
+    ("csv",   os.path.join(ROOT, "workers", "csv",   "main.py"), 3003),
+    ("image", os.path.join(ROOT, "workers", "image", "main.py"), 3004),
+    ("audio", os.path.join(ROOT, "workers", "audio", "main.py"), 3005),
+    ("video", os.path.join(ROOT, "workers", "video", "main.py"), 3006),
 ]
 
 

@@ -91,7 +91,44 @@ func classifyTask(content string) (string, string, error) {
 		strings.Contains(low, "stats") || strings.Contains(low, "describe") {
 		return "csv_stats", content, nil
 	}
-	return "", "", fmt.Errorf("unable to classify task from prompt; please include keywords like '格式化代码', '摘要', '蒙特卡洛'")
+	// image: image_txt2img / image_img2img / image_inpaint / image_controlnet
+	if strings.Contains(low, "出图") || strings.Contains(low, "画") ||
+		strings.Contains(low, "img2img") || strings.Contains(low, "inpaint") ||
+		strings.Contains(low, "controlnet") ||
+		strings.Contains(low, "txt2img") || strings.Contains(low, "生图") {
+		taskType := "image_txt2img"
+		if strings.Contains(low, "img2img") {
+			taskType = "image_img2img"
+		} else if strings.Contains(low, "inpaint") || strings.Contains(low, "重绘") {
+			taskType = "image_inpaint"
+		} else if strings.Contains(low, "controlnet") {
+			taskType = "image_controlnet"
+		}
+		return taskType, content, nil
+	}
+	// audio: audio_tts_line / audio_tts_with_emotion
+	if strings.Contains(low, "朗读") || strings.Contains(low, "配音") ||
+		strings.Contains(low, "tts") || strings.Contains(low, "语音") ||
+		strings.Contains(low, "念") || strings.Contains(low, "情感") {
+		taskType := "audio_tts_line"
+		if strings.Contains(low, "情感") || strings.Contains(low, "emotion") {
+			taskType = "audio_tts_with_emotion"
+		}
+		return taskType, content, nil
+	}
+	// video: video_assemble_clip / video_add_subtitle / video_kenburns
+	if strings.Contains(low, "动画") || strings.Contains(low, "短片") ||
+		strings.Contains(low, "kenburns") || strings.Contains(low, "字幕") ||
+		strings.Contains(low, "assemble") || strings.Contains(low, "剪辑") {
+		taskType := "video_assemble_clip"
+		if strings.Contains(low, "字幕") || strings.Contains(low, "subtitle") {
+			taskType = "video_add_subtitle"
+		} else if strings.Contains(low, "kenburns") {
+			taskType = "video_kenburns"
+		}
+		return taskType, content, nil
+	}
+	return "", "", fmt.Errorf("unable to classify task from prompt; please include keywords like '格式化代码', '摘要', '蒙特卡洛', '出图', '朗读', '动画'")
 }
 
 // parseMonteCarloConfig tries to extract Monte Carlo parameters from natural language.

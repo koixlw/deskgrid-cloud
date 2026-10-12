@@ -20,6 +20,9 @@ vendor/
 logs/
 *.out.log
 
+# Worker output artifacts (PNG / WAV / MP4 generated at runtime)
+artifacts/
+
 # IDE
 .vscode/
 .idea/

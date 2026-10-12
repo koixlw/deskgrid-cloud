@@ -106,6 +106,22 @@ func (s *Store) UpdateHeartbeat(id string, cpu, mem float64, queueLen int) *Work
 	return w
 }
 
+// RemoveWorker deletes a worker from the map entirely. Re-registration
+// with the same ID is allowed (worker comes back on next heartbeat).
+func (s *Store) RemoveWorker(id string) *Worker {
+	s.mu.Lock()
+	w, ok := s.workers[id]
+	if !ok {
+		s.mu.Unlock()
+		return nil
+	}
+	delete(s.workers, id)
+	cp := *w
+	s.mu.Unlock()
+	s.notify("worker_deleted", &cp)
+	return &cp
+}
+
 func (s *Store) MarkOffline(id string) {
 	s.mu.Lock()
 	w, ok := s.workers[id]

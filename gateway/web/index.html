@@ -78,6 +78,21 @@
             <option value="csv_montecarlo">蒙特卡洛模拟 (csv_montecarlo)</option>
             <option value="csv_stats">描述统计 (csv_stats)</option>
           </optgroup>
+          <optgroup label="图像算力">
+            <option value="image_txt2img">文生图 (image_txt2img)</option>
+            <option value="image_img2img">图生图 (image_img2img)</option>
+            <option value="image_inpaint">局部重绘 (image_inpaint)</option>
+            <option value="image_controlnet">控制网 (image_controlnet)</option>
+          </optgroup>
+          <optgroup label="语音算力">
+            <option value="audio_tts_line">语音合成 (audio_tts_line)</option>
+            <option value="audio_tts_with_emotion">情感 TTS (audio_tts_with_emotion)</option>
+          </optgroup>
+          <optgroup label="视频算力">
+            <option value="video_assemble_clip">镜头组装 (video_assemble_clip)</option>
+            <option value="video_add_subtitle">添加字幕 (video_add_subtitle)</option>
+            <option value="video_kenburns">推拉镜头 (video_kenburns)</option>
+          </optgroup>
         </select>
       </div>
       <div class="form-row">
@@ -99,6 +114,7 @@
       <span class="worker-name"></span>
       <span class="worker-type"></span>
       <span class="worker-status">online</span>
+      <button class="worker-delete" title="删除节点" aria-label="删除节点">×</button>
     </div>
     <div class="worker-cpu"></div>
     <div class="meter">

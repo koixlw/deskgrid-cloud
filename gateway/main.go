@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,6 +16,10 @@ import (
 
 //go:embed web/*
 var webFS embed.FS
+
+// artifactsDir is the on-disk folder where workers write generated images,
+// audio, and video. Exposed read-only via HTTP at /artifacts/.
+var artifactsDir = envOr("ARTIFACTS_DIR", `E:\deskgrid-cloud\artifacts`)
 
 func main() {
 	logDir := envOr("LOG_DIR", "./logs")
@@ -69,6 +74,22 @@ func main() {
 			serveIndex(c, sub)
 		})
 	}
+
+	// serve generated artifacts (images / audio / video written by workers)
+	engine.GET("/artifacts/*filepath", func(c *gin.Context) {
+		rel := strings.TrimPrefix(c.Param("filepath"), "/")
+		if rel == "" {
+			c.String(400, "filename required")
+			return
+		}
+		// path traversal guard
+		if strings.Contains(rel, "..") {
+			c.String(400, "bad path")
+			return
+		}
+		full := artifactsDir + "/" + filepath.FromSlash(rel)
+		c.File(full)
+	})
 
 	addr := envOr("GATEWAY_ADDR", ":13000")
 	internal.Info("deskgrid-cloud-gateway listening on %s", addr)
