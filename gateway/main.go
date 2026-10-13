@@ -45,10 +45,15 @@ func main() {
 	// so every state change broadcasts to WS AND is queued for disk flush.
 	persistence := internal.NewPersistence(dataDir, store)
 	hubBroadcast := hub.Broadcast
+	peers := internal.NewPeerSync(os.Getenv("GATEWAY_PEERS"))
 	store.SetNotifier(func(event string, payload interface{}) {
 		hubBroadcast(event, payload)
 		persistence.OnEvent(event, payload)
+		peers.BroadcastEvent(event, payload)
 	})
+	if peers.Enabled() {
+		internal.Info("peer replication ENABLED")
+	}
 	store.StartOfflineSweeper(6*time.Second, 2*time.Second)
 	store.StartCleanupLoop(5 * time.Minute)
 	defer persistence.Stop()

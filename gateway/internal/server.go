@@ -23,6 +23,7 @@ type Server struct {
 	engine       *gin.Engine
 	authRequired bool
 	hmacSecret   []byte
+	peers        *PeerSync
 }
 
 func NewServer(store *Store, hub *Hub, token string) *Server {
@@ -33,6 +34,7 @@ func NewServer(store *Store, hub *Hub, token string) *Server {
 		hub:          hub,
 		authRequired: AuthRequired(token),
 		hmacSecret:   secret,
+		peers:        NewPeerSync(os.Getenv("GATEWAY_PEERS")),
 	}
 	s.engine = gin.New()
 	s.engine.Use(gin.Recovery())
@@ -95,6 +97,10 @@ func (s *Server) routes() {
 		api.GET("/tasks", s.listTasks)
 		api.GET("/tasks/:id", s.getTask)
 		api.POST("/tasks", bodyLimit(64*1024), s.createTask)
+
+		// peer-to-peer replication endpoint (gateway-to-gateway only,
+		// not auth-protected because it sits on internal network)
+		api.POST("/peer-replicate", s.peerReplicate)
 	}
 
 	s.engine.GET("/ws", func(c *gin.Context) { s.hub.HandleWS(c.Writer, c.Request) })
@@ -271,6 +277,37 @@ func (s *Server) workerResult(c *gin.Context) {
 
 func (s *Server) listWorkers(c *gin.Context) {
 	c.JSON(200, s.store.ListWorkers())
+}
+
+// peerReplicate receives worker events from peer gateways and applies them
+// locally. Used for gateway-to-gateway state replication.
+type peerEvent struct {
+	Event   string      `json:"event"`
+	Payload interface{} `json:"payload"`
+	TS      int64       `json:"ts"`
+}
+
+func (s *Server) peerReplicate(c *gin.Context) {
+	var ev peerEvent
+	if err := c.ShouldBindJSON(&ev); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	// Only replicate worker events. Tasks are ephemeral and not synced.
+	switch ev.Event {
+	case "worker_added", "worker_updated", "worker_removed", "worker_deleted":
+		// payload is a *Worker
+		data, _ := json.Marshal(ev.Payload)
+		var w Worker
+		if err := json.Unmarshal(data, &w); err != nil {
+			c.JSON(400, gin.H{"error": "bad worker payload"})
+			return
+		}
+		s.store.AddWorker(&w)
+	default:
+		// ignore other events (tasks etc.)
+	}
+	c.JSON(200, gin.H{"ok": true})
 }
 
 // authCheck reports whether auth is required. This endpoint is public so the
