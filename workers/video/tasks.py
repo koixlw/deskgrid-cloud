@@ -62,7 +62,7 @@ def _parse_payload(payload):
     return {}
 
 
-def assemble_clip(task_id, payload, reporter):
+def assemble_clip(task_id, payload, reporter, cancel_event=None):
     reporter.progress(10, "[clip] parse")
     p = _parse_payload(payload)
     if "scenes" not in p:
@@ -93,12 +93,12 @@ def assemble_clip(task_id, payload, reporter):
     }
 
 
-def add_subtitle(task_id, payload, reporter):
+def add_subtitle(task_id, payload, reporter, cancel_event=None):
     """Persist a baked subtitle task. Reuses clip assembly - same artifact."""
     return assemble_clip(task_id, payload, reporter)
 
 
-def kenburns(task_id, payload, reporter):
+def kenburns(task_id, payload, reporter, cancel_event=None):
     reporter.progress(10, "[kenburns] parse")
     p = _parse_payload(payload)
     prompt = (p.get("prompt") or "kenburns zoom").strip()[:80]

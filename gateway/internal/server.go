@@ -64,6 +64,7 @@ func (s *Server) routes() {
 		api.POST("/workers/:id/heartbeat", s.heartbeat)
 		api.POST("/workers/:id/progress", s.workerProgress)
 		api.POST("/workers/:id/result", s.workerResult)
+		api.POST("/workers/:id/task/cancel", s.cancelTask)
 
 		api.GET("/tasks", s.listTasks)
 		api.GET("/tasks/:id", s.getTask)
@@ -129,9 +130,11 @@ func (s *Server) registerWorker(c *gin.Context) {
 }
 
 type heartbeatReq struct {
-	CPUUsage float64 `json:"cpu_usage"`
-	MemUsage float64 `json:"mem_usage"`
-	QueueLen int     `json:"queue_len"`
+	CPUUsage      float64 `json:"cpu_usage"`
+	MemUsage      float64 `json:"mem_usage"`
+	QueueLen      int     `json:"queue_len"`
+	GPUMemUsedMB  int64   `json:"gpu_mem_used_mb"`
+	GPUMemTotalMB int64   `json:"gpu_mem_total_mb"`
 }
 
 func (s *Server) heartbeat(c *gin.Context) {
@@ -141,11 +144,33 @@ func (s *Server) heartbeat(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	w := s.store.UpdateHeartbeat(id, req.CPUUsage, req.MemUsage, req.QueueLen)
+	w := s.store.UpdateHeartbeat(id, req.CPUUsage, req.MemUsage, req.QueueLen, req.GPUMemUsedMB, req.GPUMemTotalMB)
 	if w == nil {
 		c.JSON(404, gin.H{"error": "worker not found"})
 		return
 	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+// cancelTask asks the worker to abort a running task. Workers check their
+// per-task cancel channel between progress updates.
+type cancelTaskReq struct {
+	TaskID string `json:"task_id"`
+}
+
+func (s *Server) cancelTask(c *gin.Context) {
+	id := c.Param("id")
+	var req cancelTaskReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if !s.store.CancelTask(req.TaskID) {
+		c.JSON(404, gin.H{"error": "task not running or not found"})
+		return
+	}
+	// forward to worker so it can abort the thread
+	go s.pushCancelToWorker(id, req.TaskID)
 	c.JSON(200, gin.H{"ok": true})
 }
 
@@ -200,8 +225,21 @@ func (s *Server) workerResult(c *gin.Context) {
 	}
 	if req.Success {
 		s.store.FinishTask(req.TaskID, req.Result, "", true)
+		s.store.RecordTaskResult(id, true)
 	} else {
 		s.store.FinishTask(req.TaskID, "", req.Error, false)
+		s.store.RecordTaskResult(id, false)
+		// automatic retry if allowed; pick a different worker than the one that failed
+		if t := s.store.GetTask(req.TaskID); t != nil {
+			if t.Retries < t.MaxRetries {
+				if s.store.RetryTask(req.TaskID) {
+					Info("task %s retrying (%d/%d) after worker %s failed: %s",
+						req.TaskID, t.Retries+1, t.MaxRetries, id, req.Error)
+					go s.dispatchRetry(t.Type, t.Payload, t.Source,
+						t.Priority, t.MaxRetries, t.TimeoutSecs, t.Retries+1, id)
+				}
+			}
+		}
 	}
 	c.JSON(200, gin.H{"ok": true})
 }
@@ -243,9 +281,12 @@ func (s *Server) deleteWorker(c *gin.Context) {
 // ---------- Task endpoints ----------
 
 type createTaskReq struct {
-	Type    string `json:"type"`
-	Payload string `json:"payload"`
-	Source  string `json:"source"` // panel | openai
+	Type        string `json:"type"`
+	Payload     string `json:"payload"`
+	Source      string `json:"source"`       // panel | openai
+	Priority    int    `json:"priority"`     // higher = more important
+	MaxRetries  int    `json:"max_retries"`  // 0 = no retry
+	TimeoutSecs int    `json:"timeout_secs"` // 0 = use default 300s
 }
 
 func (s *Server) createTask(c *gin.Context) {
@@ -261,7 +302,8 @@ func (s *Server) createTask(c *gin.Context) {
 	if req.Source == "" {
 		req.Source = "panel"
 	}
-	task, err := s.dispatchTask(req.Type, req.Payload, req.Source)
+	task, err := s.dispatchTaskWithParams(req.Type, req.Payload, req.Source,
+		req.Priority, req.MaxRetries, req.TimeoutSecs)
 	if err != nil {
 		c.JSON(503, gin.H{"error": err.Error()})
 		return
@@ -270,26 +312,73 @@ func (s *Server) createTask(c *gin.Context) {
 }
 
 func (s *Server) dispatchTask(taskType, payload, source string) (*Task, error) {
-	worker := s.store.PickWorker(taskType)
+	return s.dispatchTaskWithParams(taskType, payload, source, 0, 0, 0)
+}
+
+// dispatchTaskWithParams creates a task with the given scheduling hints and
+// dispatches it to the best available worker (excluding any worker IDs in
+// excludeWorkerID — used during retry).
+func (s *Server) dispatchTaskWithParams(taskType, payload, source string,
+	priority, maxRetries, timeoutSecs int, excludeWorkerID ...string) (*Task, error) {
+	worker := s.store.PickWorker(taskType, excludeWorkerID...)
 	if worker == nil {
 		return nil, fmt.Errorf("no available worker for type=%s", taskType)
 	}
 	t := &Task{
-		ID:        uuid.NewString(),
-		Type:      taskType,
-		Payload:   payload,
-		Source:    source,
-		Status:    "pending",
-		Progress:  0,
-		CreatedAt: time.Now(),
-		Logs:      []string{},
+		ID:          uuid.NewString(),
+		Type:        taskType,
+		Payload:     payload,
+		Source:      source,
+		Priority:    priority,
+		MaxRetries:  maxRetries,
+		Retries:     0,
+		TimeoutSecs: timeoutSecs,
+		Status:      "pending",
+		Progress:    0,
+		CreatedAt:   time.Now(),
+		Logs:        []string{},
 	}
 	s.store.AddTask(t)
 	s.store.AssignTask(t.ID, worker.ID)
 
-	// async push to worker
 	go s.pushToWorker(worker, t)
 	return t, nil
+}
+
+// dispatchRetry is a convenience wrapper that excludes a specific failed worker.
+func (s *Server) dispatchRetry(taskType, payload, source string,
+	priority, maxRetries, timeoutSecs, retryCount int, excludeWorkerID string) {
+	_, _ = s.dispatchTaskWithParams(taskType, payload, source,
+		priority, maxRetries, timeoutSecs, excludeWorkerID)
+}
+
+// DispatchRetry exposes the retry helper so the timeout sweeper (started by
+// main.go after Server is constructed) can invoke it.
+func (s *Server) DispatchRetry(taskType, payload, source string,
+	priority, maxRetries, timeoutSecs, retryCount int, excludeWorkerID string) {
+	s.dispatchRetry(taskType, payload, source, priority, maxRetries, timeoutSecs, retryCount, excludeWorkerID)
+}
+
+// pushCancelToWorker tells a worker to abort a specific task. Best-effort:
+// if the worker is unreachable we still leave the cancel flag in the store so
+// the gateway side tracks it correctly.
+func (s *Server) pushCancelToWorker(workerID, taskID string) {
+	w := s.store.GetWorker(workerID)
+	if w == nil {
+		return
+	}
+	url := fmt.Sprintf("http://%s:%d/task/cancel", resolveWorkerHost(w), w.Port)
+	body, _ := json.Marshal(map[string]string{"task_id": taskID})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		Warn("cancel push failed worker=%s task=%s: %v", workerID, taskID, err)
+		return
+	}
+	defer resp.Body.Close()
 }
 
 func (s *Server) pushToWorker(w *Worker, t *Task) {

@@ -15,7 +15,7 @@ def _parse_or_none(src: str):
         return e
 
 
-def format_code(task_id: str, payload: str, reporter) -> dict:
+def format_code(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     """Reformat Python source code using ast.parse + ast.unparse.
 
     For code that can't be parsed, fall back to whitespace normalization.
@@ -63,7 +63,7 @@ def format_code(task_id: str, payload: str, reporter) -> dict:
         }
 
 
-def count_ast(task_id: str, payload: str, reporter) -> dict:
+def count_ast(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     """Count functions, classes, loops, branches, and max nesting depth."""
     reporter.progress(15, "[ast] 解析")
     time.sleep(0.2)

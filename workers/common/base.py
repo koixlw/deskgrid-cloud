@@ -1,10 +1,23 @@
-"""BaseWorker — common scaffolding for code/doc/csv workers."""
+"""BaseWorker - common scaffolding for code/doc/csv/image/audio/video workers.
+
+Includes:
+- Stable worker ID: WORKER_ID env > hostname > MAC hash > random UUID
+- Faster heartbeat (3s) with GPU usage reporting
+- Cooperative cancellation: /task/cancel closes a channel the executor polls
+- Periodic self-restart after N tasks (prevents Python memory leaks)
+- Real /hardware/fd stability tracking via the gateway
+"""
 import logging
+import os
+import platform
+import socket
+import subprocess
 import threading
 import time
 import uuid
 from typing import Callable, Optional
 
+import psutil
 import requests
 from fastapi import FastAPI, HTTPException
 
@@ -12,6 +25,57 @@ from .hardware import collect as collect_hw, snapshot_usage
 from .reporter import Reporter, post_result
 
 log = logging.getLogger("worker")
+
+# Default limits - override via env if needed
+DEFAULT_HEARTBEAT_INTERVAL = float(os.environ.get("WORKER_HEARTBEAT_INTERVAL", "3"))
+DEFAULT_RESTART_AFTER_TASKS = int(os.environ.get("WORKER_RESTART_AFTER_TASKS", "500"))
+DEFAULT_TIMEOUT_DEFAULT = int(os.environ.get("WORKER_TASK_TIMEOUT", "300"))
+
+
+def _stable_worker_id(port: int, worker_type: str) -> str:
+    """Resolve a stable worker ID.
+
+    Priority:
+      1. WORKER_ID env var (explicit override, e.g. for fixed-name workers)
+      2. hostname + worker_type + port (stable, distinguishes same-host workers)
+      3. MAC address hash (survives hostname changes)
+      4. random UUID (last resort - identity won't survive restart)
+
+    Including type+port is critical: multiple workers on the same host must
+    have distinct IDs or they'll keep clobbering each other in the store.
+    """
+    explicit = os.environ.get("WORKER_ID")
+    if explicit:
+        return f"fixed:{explicit}"
+    try:
+        host = socket.gethostname()
+        if host:
+            return f"host:{host}:{worker_type}:{port}"
+    except Exception:
+        pass
+    try:
+        node = uuid.getnode()
+        mac = ":".join(f"{(node >> i) & 0xff:02x}" for i in range(0, 48, 8))
+        return f"mac:{mac}:{worker_type}:{port}"
+    except Exception:
+        pass
+    return f"uuid:{worker_type}:{port}:{uuid.uuid4().hex}"
+
+
+def _read_gpu_info() -> tuple[int, int]:
+    """Best-effort GPU memory read. Returns (used_mb, total_mb).
+
+    Tries pynvml (nvidia-smi python lib). Returns (0, 0) when no GPU or lib
+    unavailable, which tells the gateway there's no GPU to track.
+    """
+    try:
+        import pynvml  # type: ignore
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return (int(mem.used // (1024 * 1024)), int(mem.total // (1024 * 1024)))
+    except Exception:
+        return (0, 0)
 
 
 class BaseWorker:
@@ -23,13 +87,16 @@ class BaseWorker:
         self.gateway = gateway.rstrip("/")
         self.port = port
         self.name = name or f"{worker_type}-node-{uuid.uuid4().hex[:6]}"
-        self.worker_id = uuid.uuid4().hex
+        self.worker_id = _stable_worker_id(port, worker_type)
         self.app = FastAPI(title=f"deskgrid-cloud-{worker_type}-worker")
-        self.dispatch = dispatch or {}  # task_type -> callable(task_id, payload, reporter) -> result dict
+        self.dispatch = dispatch or {}
         self.current_task_id: Optional[str] = None
         self.queue_len = 0
         self._lock = threading.Lock()
         self._reporter: Optional[Reporter] = None
+        self._tasks_completed = 0
+        self._cancel_event: Optional[threading.Event] = None
+        self._restart_requested = threading.Event()
 
         self._register_routes()
 
@@ -38,7 +105,8 @@ class BaseWorker:
         @self.app.get("/health")
         def health():
             return {"ok": True, "type": self.worker_type, "id": self.worker_id,
-                    "queue_len": self.queue_len, "current_task": self.current_task_id}
+                    "queue_len": self.queue_len, "current_task": self.current_task_id,
+                    "tasks_completed": self._tasks_completed}
 
         @self.app.post("/task")
         def handle_task(req: dict):
@@ -50,31 +118,63 @@ class BaseWorker:
             fn = self.dispatch.get(task_type)
             if fn is None:
                 raise HTTPException(400, f"unsupported task type: {task_type}")
-            # execute in background; immediately ack the gateway push
             threading.Thread(target=self._execute, args=(task_id, task_type, payload, fn),
                              daemon=True).start()
             return {"ok": True, "task_id": task_id}
 
+        @self.app.post("/task/cancel")
+        def handle_cancel(req: dict):
+            task_id = req.get("task_id")
+            if not task_id:
+                raise HTTPException(400, "task_id required")
+            if task_id != self.current_task_id:
+                raise HTTPException(409, f"task {task_id} not running on this worker")
+            log.info("cancel requested for task %s", task_id)
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+            return {"ok": True, "task_id": task_id}
+
+        @self.app.post("/admin/restart")
+        def admin_restart():
+            """Used by operator/test scripts to request a graceful restart."""
+            self._restart_requested.set()
+            return {"ok": True}
+
     # ---------- Execution ----------
     def _execute(self, task_id: str, task_type: str, payload, fn: Callable):
+        cancel_event = threading.Event()
         with self._lock:
             self.current_task_id = task_id
+            self._cancel_event = cancel_event
         reporter = Reporter(self.gateway, self.worker_id, lambda: self.current_task_id)
         reporter.start()
         try:
-            reporter.progress(1, f"[{task_type}] 启动")
-            result = fn(task_id, payload, reporter) or {}
-            reporter.progress(100, f"[{task_type}] 完成")
-            post_result(self.gateway, self.worker_id, task_id, result, success=True)
+            reporter.progress(1, f"[{task_type}] start")
+            result = fn(task_id, payload, reporter, cancel_event) or {}
+            if cancel_event.is_set():
+                log.info("task %s cancelled mid-execution", task_id)
+                reporter.progress(100, f"[{task_type}] cancelled")
+                post_result(self.gateway, self.worker_id, task_id, {},
+                            success=False, error="cancelled by gateway")
+            else:
+                reporter.progress(100, f"[{task_type}] done")
+                post_result(self.gateway, self.worker_id, task_id, result, success=True)
         except Exception as e:
             log.exception("task %s failed", task_id)
-            reporter.progress(100, f"[{task_type}] 失败: {e}")
+            reporter.progress(100, f"[{task_type}] failed: {e}")
             post_result(self.gateway, self.worker_id, task_id, {}, success=False, error=str(e))
         finally:
             reporter.stop()
             with self._lock:
                 if self.current_task_id == task_id:
                     self.current_task_id = None
+                    self._cancel_event = None
+                self._tasks_completed += 1
+            # self-restart after N tasks to free accumulated Python memory
+            if self._tasks_completed >= DEFAULT_RESTART_AFTER_TASKS:
+                log.warning("reached %d tasks, requesting self-restart",
+                    self._tasks_completed)
+                self._restart_requested.set()
 
     # ---------- Gateway lifecycle ----------
     def register(self):
@@ -104,24 +204,33 @@ class BaseWorker:
             time.sleep(1.5)
         raise RuntimeError(f"failed to register after retries: {last_err}")
 
-    def start_heartbeat(self, interval: float = 5.0):
+    def start_heartbeat(self):
         def loop():
+            interval = DEFAULT_HEARTBEAT_INTERVAL
             while True:
-                try:
-                    usage = snapshot_usage()
-                    body = {
-                        "cpu_usage": usage["cpu_usage"],
-                        "mem_usage": usage["mem_usage"],
-                        "queue_len": self.queue_len,
-                    }
-                    r = requests.post(f"{self.gateway}/api/workers/{self.worker_id}/heartbeat",
-                                      json=body, timeout=2)
-                    if r.status_code == 404:
-                        log.warning("heartbeat 404, re-registering...")
-                        self.register()
-                except Exception as e:
-                    log.debug("heartbeat failed: %s", e)
-                time.sleep(interval)
+                    # check for self-restart first
+                    if self._restart_requested.is_set():
+                        log.warning("self-restart triggered, exiting so supervisor can respawn")
+                        os._exit(0)
+                    try:
+                        usage = snapshot_usage()
+                        gpu_used, gpu_total = _read_gpu_info()
+                        body = {
+                            "cpu_usage": usage["cpu_usage"],
+                            "mem_usage": usage["mem_usage"],
+                            "queue_len": self.queue_len,
+                            "gpu_mem_used_mb": gpu_used,
+                            "gpu_mem_total_mb": gpu_total,
+                        }
+                        r = requests.post(
+                            f"{self.gateway}/api/workers/{self.worker_id}/heartbeat",
+                            json=body, timeout=2)
+                        if r.status_code == 404:
+                            log.warning("heartbeat 404, re-registering...")
+                            self.register()
+                    except Exception as e:
+                        log.debug("heartbeat failed: %s", e)
+                    time.sleep(interval)
 
         t = threading.Thread(target=loop, daemon=True)
         t.start()

@@ -92,7 +92,7 @@ def _parse_payload(payload):
     return {"prompt": str(payload)}
 
 
-def txt2img(task_id, payload, reporter):
+def txt2img(task_id, payload, reporter, cancel_event=None):
     reporter.progress(5, "[txt2img] parse prompt")
     p = _parse_payload(payload)
     prompt = (p.get("prompt") or "an orange cat").strip()[:400]
@@ -134,7 +134,7 @@ def txt2img(task_id, payload, reporter):
     }
 
 
-def img2img(task_id, payload, reporter):
+def img2img(task_id, payload, reporter, cancel_event=None):
     reporter.progress(5, "[img2img] parse")
     p = _parse_payload(payload)
     strength = float(p.get("strength", 0.6))
@@ -161,7 +161,7 @@ def img2img(task_id, payload, reporter):
     }
 
 
-def inpaint(task_id, payload, reporter):
+def inpaint(task_id, payload, reporter, cancel_event=None):
     reporter.progress(5, "[inpaint] parse")
     p = _parse_payload(payload)
     prompt = (p.get("prompt") or "replace this area").strip()[:200]
@@ -189,7 +189,7 @@ def inpaint(task_id, payload, reporter):
     }
 
 
-def controlnet(task_id, payload, reporter):
+def controlnet(task_id, payload, reporter, cancel_event=None):
     reporter.progress(5, "[controlnet] parse")
     p = _parse_payload(payload)
     prompt = (p.get("prompt") or "controlnet hint").strip()[:200]

@@ -2,14 +2,13 @@ package internal
 
 import "time"
 
-// ScoreWorker scores a worker for suitability to run a task of type t.
-// Higher score = better candidate. Returns -1 if worker is not eligible.
-// A worker whose Type is a prefix of taskType (separated by "_") is eligible.
+// workerMatchesType returns true if w can serve taskType. A worker whose Type
+// is a prefix of taskType (separated by "_") is eligible. e.g. "image" worker
+// can serve "image_txt2img".
 func workerMatchesType(w *Worker, taskType string) bool {
 	if w.Type == taskType {
 		return true
 	}
-	// accept "code_format" -> worker.Type=="code", "doc_summary" -> "doc", etc.
 	prefix := taskType
 	if i := indexByte(taskType, '_'); i >= 0 {
 		prefix = taskType[:i]
@@ -28,6 +27,20 @@ func indexByte(s string, c byte) int {
 
 // ScoreWorker scores a worker for suitability to run a task of type t.
 // Higher score = better candidate. Returns -1 if worker is not eligible.
+//
+// Formula:
+//
+//	cpuFree   = 100 - cpu_usage
+//	memFree   = 100 - mem_usage
+//	gpuFree   = 100 - gpu_used%   (or 100 if no GPU)
+//	queueScore = 100 - min(queue*20, 100)
+//	stability = 0.5 .. 1.0  (worker reliability factor)
+//
+//	score = 0.40 * cpuFree
+//	      + 0.25 * memFree
+//	      + 0.10 * gpuFree
+//	      + 0.15 * queueScore
+//	      + 0.10 * (stability * 100)
 func ScoreWorker(w *Worker, taskType string) float64 {
 	if !workerMatchesType(w, taskType) {
 		return -1
@@ -35,6 +48,7 @@ func ScoreWorker(w *Worker, taskType string) float64 {
 	if w.Status == "offline" {
 		return -1
 	}
+
 	cpuFree := 100 - w.CPUUsage
 	if cpuFree < 0 {
 		cpuFree = 0
@@ -47,16 +61,44 @@ func ScoreWorker(w *Worker, taskType string) float64 {
 	if queueScore < 0 {
 		queueScore = 0
 	}
-	return 0.5*cpuFree + 0.3*memFree + 0.2*queueScore
+
+	gpuFree := 100.0
+	if w.GPUMemTotalMB > 0 {
+		used := float64(w.GPUMemUsedMB) / float64(w.GPUMemTotalMB) * 100
+		gpuFree = 100 - used
+		if gpuFree < 0 {
+			gpuFree = 0
+		}
+	}
+
+	stability := w.Stability
+	if stability < 0.5 {
+		stability = 0.5 // clamp to avoid total disqualification from one bad run
+	}
+
+	return 0.40*cpuFree +
+		0.25*memFree +
+		0.10*gpuFree +
+		0.15*queueScore +
+		0.10*stability*100
 }
 
-// PickWorker selects the best worker for the given task type.
-func (s *Store) PickWorker(taskType string) *Worker {
+// PickWorker selects the best worker for the given task type. Optionally
+// excludes a worker ID (used during re-dispatch on retry to avoid sending the
+// same failing task back to the same node).
+func (s *Store) PickWorker(taskType string, excludeWorkerID ...string) *Worker {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	excluded := make(map[string]bool, len(excludeWorkerID))
+	for _, id := range excludeWorkerID {
+		excluded[id] = true
+	}
 	var best *Worker
 	var bestScore float64 = -1
 	for _, w := range s.workers {
+		if excluded[w.ID] {
+			continue
+		}
 		score := ScoreWorker(w, taskType)
 		if score > bestScore {
 			bestScore = score
@@ -74,6 +116,26 @@ func (s *Store) StartOfflineSweeper(timeout, interval time.Duration) {
 		defer t.Stop()
 		for range t.C {
 			s.SweepOffline(timeout)
+		}
+	}()
+}
+
+// StartTimeoutSweeper fails running tasks whose StartedAt + TimeoutSecs is past.
+// Re-dispatches retriable tasks to the next-best worker.
+func (s *Store) StartTimeoutSweeper(interval time.Duration, dispatchRetry func(taskType, payload, source string, priority, maxRetries, timeoutSecs, retryCount int, excludeWorkerID string)) {
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for range t.C {
+			retriable := s.SweepTimeouts(0) // 0 = use per-task TimeoutSecs
+			for _, t := range retriable {
+				if s.RetryTask(t.ID) {
+					Info("task %s retrying (%d/%d) after timeout on worker %s",
+						t.ID, t.Retries+1, t.MaxRetries, t.WorkerID)
+					dispatchRetry(t.Type, t.Payload, t.Source,
+						t.Priority, t.MaxRetries, t.TimeoutSecs, t.Retries+1, t.WorkerID)
+				}
+			}
 		}
 	}()
 }

@@ -48,3 +48,9 @@ func Errorf(format string, args ...interface{}) {
 		errorLog.Output(2, fmt.Sprintf(format, args...))
 	}
 }
+
+func Warn(format string, args ...interface{}) {
+	if infoLog != nil {
+		infoLog.Output(2, "[WARN] "+fmt.Sprintf(format, args...))
+	}
+}

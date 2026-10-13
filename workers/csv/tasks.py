@@ -25,7 +25,7 @@ def _parse_numbers(payload: str) -> list[float]:
     return out
 
 
-def montecarlo(task_id: str, payload: str, reporter) -> dict:
+def montecarlo(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     """Run a Monte Carlo simulation.
 
     Payload formats accepted:
@@ -109,7 +109,7 @@ def montecarlo(task_id: str, payload: str, reporter) -> dict:
     }
 
 
-def stats(task_id: str, payload: str, reporter) -> dict:
+def stats(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     """Compute descriptive statistics for a list of numbers."""
     reporter.progress(15, "[stats] 解析数字")
     time.sleep(0.15)

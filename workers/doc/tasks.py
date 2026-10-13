@@ -99,7 +99,7 @@ def textrank(sentences: list[str], top_n: int = 3, damping: float = 0.85, iters:
     return [sentences[i] for i, _ in chosen]
 
 
-def summarize(task_id: str, payload: str, reporter) -> dict:
+def summarize(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     """Generate a TextRank-style extractive summary."""
     reporter.progress(10, "[summary] 分句")
     time.sleep(0.2)
@@ -124,7 +124,7 @@ def summarize(task_id: str, payload: str, reporter) -> dict:
     }
 
 
-def wordfreq(task_id: str, payload: str, reporter) -> dict:
+def wordfreq(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     """Compute top-N word/bigram frequencies."""
     reporter.progress(15, "[wordfreq] 分词")
     time.sleep(0.2)

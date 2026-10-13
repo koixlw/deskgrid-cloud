@@ -49,7 +49,7 @@ func main() {
 		hubBroadcast(event, payload)
 		persistence.OnEvent(event, payload)
 	})
-	store.StartOfflineSweeper(10*time.Second, 2*time.Second)
+	store.StartOfflineSweeper(6*time.Second, 2*time.Second)
 	defer persistence.Stop()
 
 	// Restore previous state from disk, then settle in-flight tasks.
@@ -72,6 +72,9 @@ func main() {
 
 	srv := internal.NewServer(store, hub, token)
 	engine := srv.Engine()
+
+	// Timeout sweeper dispatches retries via the server's helper.
+	store.StartTimeoutSweeper(15*time.Second, srv.DispatchRetry)
 
 	// serve embedded web/
 	if sub, err := fs.Sub(webFS, "web"); err == nil {

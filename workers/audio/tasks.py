@@ -66,7 +66,7 @@ def _parse_payload(payload):
     return {"text": str(payload)}
 
 
-def tts_line(task_id, payload, reporter):
+def tts_line(task_id, payload, reporter, cancel_event=None):
     reporter.progress(10, "[tts] parse")
     p = _parse_payload(payload)
     text = (p.get("text") or "hello world").strip()
@@ -89,7 +89,7 @@ def tts_line(task_id, payload, reporter):
     }
 
 
-def tts_with_emotion(task_id, payload, reporter):
+def tts_with_emotion(task_id, payload, reporter, cancel_event=None):
     reporter.progress(10, "[tts-emo] parse")
     p = _parse_payload(payload)
     text = (p.get("text") or "hello world").strip()
