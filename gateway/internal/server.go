@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -21,14 +22,17 @@ type Server struct {
 	hub          *Hub
 	engine       *gin.Engine
 	authRequired bool
+	hmacSecret   []byte
 }
 
 func NewServer(store *Store, hub *Hub, token string) *Server {
 	gin.SetMode(gin.ReleaseMode)
+	secret := []byte(os.Getenv("GATEWAY_HMAC_SECRET"))
 	s := &Server{
 		store:        store,
 		hub:          hub,
 		authRequired: AuthRequired(token),
+		hmacSecret:   secret,
 	}
 	s.engine = gin.New()
 	s.engine.Use(gin.Recovery())
@@ -79,12 +83,14 @@ func (s *Server) routes() {
 		api.GET("/auth-check", s.authCheck)
 		api.GET("/workers", s.listWorkers)
 		api.GET("/workers/:id", s.getWorker)
-		api.POST("/workers/register", bodyLimit(16*1024), s.registerWorker)
-		api.DELETE("/workers/:id", s.deleteWorker)
-		api.POST("/workers/:id/heartbeat", bodyLimit(16*1024), s.heartbeat)
-		api.POST("/workers/:id/progress", bodyLimit(16*1024), s.workerProgress)
-		api.POST("/workers/:id/result", bodyLimit(16*1024*1024), s.workerResult)
-		api.POST("/workers/:id/task/cancel", bodyLimit(1024), s.cancelTask)
+		// Worker-originated endpoints: require HMAC signature (in addition to Bearer)
+		hmac := HMACMiddleware(s.hmacSecret)
+		api.POST("/workers/register", hmac, bodyLimit(16*1024), s.registerWorker)
+		api.DELETE("/workers/:id", hmac, bodyLimit(1024), s.deleteWorker)
+		api.POST("/workers/:id/heartbeat", hmac, bodyLimit(16*1024), s.heartbeat)
+		api.POST("/workers/:id/progress", hmac, bodyLimit(16*1024), s.workerProgress)
+		api.POST("/workers/:id/result", hmac, bodyLimit(16*1024*1024), s.workerResult)
+		api.POST("/workers/:id/task/cancel", hmac, bodyLimit(1024), s.cancelTask)
 
 		api.GET("/tasks", s.listTasks)
 		api.GET("/tasks/:id", s.getTask)

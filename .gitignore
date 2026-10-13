@@ -26,6 +26,11 @@ artifacts/
 # Gateway persistence snapshots (workers.json + tasks.json written by gateway)
 data/
 
+# TLS certificates / private keys (NEVER commit these)
+certs/
+*.pem
+*.key
+
 # IDE
 .vscode/
 .idea/

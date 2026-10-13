@@ -14,7 +14,12 @@ import urllib.error
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.path.join(ROOT, "logs")
 GATEWAY_EXE = os.path.join(ROOT, "bin", "gateway.exe")
-GATEWAY_URL = "http://127.0.0.1:13000"
+# Default scheme is http. If TLS is enabled via env, switch to https and tell
+# workers to skip cert verification (self-signed certs are common for LAN).
+_scheme = "https" if os.environ.get("GATEWAY_TLS_CERT") else "http"
+if _scheme == "https":
+    os.environ.setdefault("INSECURE_SKIP_TLS_VERIFY", "1")
+GATEWAY_URL = f"{_scheme}://127.0.0.1:13000"
 GATEWAY_PORT = 13000
 WORKERS = [
     ("code",  os.path.join(ROOT, "workers", "code",  "main.py"), 3001),

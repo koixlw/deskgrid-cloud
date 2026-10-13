@@ -14,6 +14,9 @@ Includes:
 - Watchdog: hard-kill (terminate()) subprocess after TaskTimeoutSecs
 - Periodic self-restart after N tasks (prevent Python memory leaks)
 """
+import hashlib
+import hmac
+import json as _json_mod
 import logging
 import multiprocessing
 import os
@@ -27,6 +30,7 @@ from typing import Callable, Optional
 
 import psutil
 import requests
+import urllib3
 from fastapi import FastAPI, HTTPException
 
 from .hardware import collect as collect_hw, snapshot_usage
@@ -37,6 +41,46 @@ log = logging.getLogger("worker")
 DEFAULT_HEARTBEAT_INTERVAL = float(os.environ.get("WORKER_HEARTBEAT_INTERVAL", "3"))
 DEFAULT_RESTART_AFTER_TASKS = int(os.environ.get("WORKER_RESTART_AFTER_TASKS", "500"))
 DEFAULT_TIMEOUT_DEFAULT = int(os.environ.get("WORKER_TASK_TIMEOUT", "300"))
+
+
+# HMAC support: workers sign requests with shared secret.
+HMAC_SECRET = os.environ.get("GATEWAY_HMAC_SECRET", "").encode()
+INSECURE_SKIP_TLS = os.environ.get("INSECURE_SKIP_TLS_VERIFY", "0") == "1"
+
+if HMAC_SECRET:
+    log.info("HMAC signing ENABLED (shared secret set)")
+if INSECURE_SKIP_TLS:
+    log.warning("INSECURE_SKIP_TLS_VERIFY=1: not verifying TLS certificate (demo only)")
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _sign_request(body: bytes, ts: int) -> str:
+    """HMAC-SHA256 hex signature of timestamp:body using HMAC_SECRET."""
+    h = hmac.new(HMAC_SECRET, digestmod=hashlib.sha256)
+    h.update(str(ts).encode())
+    h.update(b":")
+    h.update(body)
+    return h.hexdigest()
+
+
+def signed_post(url: str, payload: dict, timeout: float = 5):
+    """POST payload to gateway, optionally HMAC-signed.
+
+    When HMAC_SECRET is set we serialize the body ourselves, sign it, and
+    send with X-Signature and X-Timestamp headers. When unset we fall back
+    to the simpler requests.post(json=...) call.
+    """
+    if not HMAC_SECRET:
+        return requests.post(url, json=payload, timeout=timeout, verify=not INSECURE_SKIP_TLS)
+    body = _json_mod.dumps(payload, ensure_ascii=False).encode()
+    ts = int(time.time())
+    sig = _sign_request(body, ts)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Signature": sig,
+        "X-Timestamp": str(ts),
+    }
+    return requests.post(url, data=body, headers=headers, timeout=timeout, verify=not INSECURE_SKIP_TLS)
 
 
 class TaskCancelled(Exception):
@@ -130,15 +174,15 @@ def _task_subprocess_entry(gateway: str, worker_id: str, task_id: str, task_type
             result_str = _json.dumps({"raw": str(result)})
         payload = {"task_id": task_id, "result": result_str, "success": success, "error": error}
         try:
-            requests.post(url, json=payload, timeout=3)
+            signed_post(url, payload, timeout=3)
         except Exception:
             pass
 
     def post_progress(pct: int, log: str = ""):
         try:
-            requests.post(
+            signed_post(
                 f"{gateway}/api/workers/{worker_id}/progress",
-                json={"task_id": task_id, "progress": pct, "log": log},
+                {"task_id": task_id, "progress": pct, "log": log},
                 timeout=1,
             )
         except Exception:
@@ -171,7 +215,12 @@ class BaseWorker:
     def __init__(self, worker_type: str, gateway: str, port: int,
                  name: Optional[str] = None, dispatch: Optional[dict] = None):
         self.worker_type = worker_type
-        self.gateway = gateway.rstrip("/")
+        # Support comma-separated GATEWAY list for failover. First entry is primary.
+        self.gateways = [g.strip().rstrip("/") for g in gateway.split(",") if g.strip()]
+        if not self.gateways:
+            self.gateways = ["http://127.0.0.1:13000"]
+        self.gateway = self.gateways[0]
+        self.gateway_idx = 0  # current primary
         self.port = port
         self.name = name or f"{worker_type}-node-{uuid.uuid4().hex[:6]}"
         self.worker_id = _stable_worker_id(port, worker_type)
@@ -307,7 +356,6 @@ class BaseWorker:
     # ---------- Gateway lifecycle ----------
     def register(self):
         hw = collect_hw()
-        url = f"{self.gateway}/api/workers/register"
         body = {
             "id": self.worker_id,
             "type": self.worker_type,
@@ -319,16 +367,22 @@ class BaseWorker:
         }
         last_err = None
         for attempt in range(10):
+            url = f"{self.gateway}/api/workers/register"
             try:
-                r = requests.post(url, json=body, timeout=3)
+                r = signed_post(url, body, timeout=3)
                 if r.ok:
-                    log.info("registered to gateway: id=%s name=%s cpu=%s",
-                             self.worker_id, self.name, hw["cpu"])
+                    log.info("registered to gateway %s: id=%s name=%s cpu=%s",
+                             self.gateway, self.worker_id, self.name, hw["cpu"])
                     return
                 last_err = f"status={r.status_code} body={r.text[:200]}"
             except Exception as e:
                 last_err = str(e)
-            log.warning("register attempt %d failed: %s", attempt + 1, last_err)
+            log.warning("register attempt %d via %s failed: %s", attempt + 1, self.gateway, last_err)
+            # On failure, try next gateway (failover)
+            if len(self.gateways) > 1 and attempt % 3 == 2:
+                self.gateway_idx = (self.gateway_idx + 1) % len(self.gateways)
+                self.gateway = self.gateways[self.gateway_idx]
+                log.info("failover: trying gateway %s", self.gateway)
             time.sleep(1.5)
         raise RuntimeError(f"failed to register after retries: {last_err}")
 
@@ -349,11 +403,17 @@ class BaseWorker:
                         "gpu_mem_used_mb": gpu_used,
                         "gpu_mem_total_mb": gpu_total,
                     }
-                    r = requests.post(
+                    r = signed_post(
                         f"{self.gateway}/api/workers/{self.worker_id}/heartbeat",
-                        json=body, timeout=2)
+                        body, timeout=2)
                     if r.status_code == 404:
                         log.warning("heartbeat 404, re-registering...")
+                        self.register()
+                    elif r.status_code in (502, 503, 504) and len(self.gateways) > 1:
+                        # gateway is down, try next
+                        self.gateway_idx = (self.gateway_idx + 1) % len(self.gateways)
+                        self.gateway = self.gateways[self.gateway_idx]
+                        log.warning("failover to gateway %s", self.gateway)
                         self.register()
                 except Exception as e:
                     log.debug("heartbeat failed: %s", e)

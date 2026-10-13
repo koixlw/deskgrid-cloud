@@ -135,10 +135,25 @@ func main() {
 	})
 
 	addr := envOr("GATEWAY_ADDR", ":13000")
-	internal.Info("deskgrid-cloud-gateway listening on %s", addr)
-	if err := engine.Run(addr); err != nil {
-		internal.Errorf("gateway exited: %v", err)
-		os.Exit(1)
+	tlsCert := envOr("GATEWAY_TLS_CERT", "")
+	tlsKey := envOr("GATEWAY_TLS_KEY", "")
+	if HMAC_SECRET := envOr("GATEWAY_HMAC_SECRET", ""); HMAC_SECRET != "" {
+		internal.Info("HMAC worker auth ENABLED")
+	} else {
+		internal.Info("HMAC worker auth disabled (GATEWAY_HMAC_SECRET unset)")
+	}
+	if tlsCert != "" && tlsKey != "" {
+		internal.Info("deskgrid-cloud-gateway listening on %s (TLS)", addr)
+		if err := engine.RunTLS(addr, tlsCert, tlsKey); err != nil {
+			internal.Errorf("gateway exited: %v", err)
+			os.Exit(1)
+		}
+	} else {
+		internal.Info("deskgrid-cloud-gateway listening on %s (no TLS, internal network only)", addr)
+		if err := engine.Run(addr); err != nil {
+			internal.Errorf("gateway exited: %v", err)
+			os.Exit(1)
+		}
 	}
 }
 
