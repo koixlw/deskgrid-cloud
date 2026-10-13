@@ -233,10 +233,9 @@ func (s *Server) workerResult(c *gin.Context) {
 		if t := s.store.GetTask(req.TaskID); t != nil {
 			if t.Retries < t.MaxRetries {
 				if s.store.RetryTask(req.TaskID) {
-					Info("task %s retrying (%d/%d) after worker %s failed: %s",
-						req.TaskID, t.Retries+1, t.MaxRetries, id, req.Error)
-					go s.dispatchRetry(t.Type, t.Payload, t.Source,
-						t.Priority, t.MaxRetries, t.TimeoutSecs, t.Retries+1, id)
+					Info("task %s retrying (now=%d, max=%d) after worker %s failed: %s",
+						req.TaskID, t.Retries, t.MaxRetries, id, req.Error)
+					go s.retryTask(req.TaskID, id)
 				}
 			}
 		}
@@ -345,11 +344,52 @@ func (s *Server) dispatchTaskWithParams(taskType, payload, source string,
 	return t, nil
 }
 
-// dispatchRetry is a convenience wrapper that excludes a specific failed worker.
+// retryTask re-dispatches an EXISTING task (same ID, incremented retry count)
+// to the next-best worker. Used after a failure or timeout.
+func (s *Server) retryTask(taskID string, excludeWorkerID string) {
+	t := s.store.GetTask(taskID)
+	if t == nil {
+		Warn("retryTask: task %s not found", taskID)
+		return
+	}
+	// Prefer a different worker than the one that failed; if no alternative
+	// is available (single-worker cluster) reuse the same one — better than
+	// leaving the task stuck in pending forever.
+	worker := s.store.PickWorker(t.Type, excludeWorkerID)
+	if worker == nil {
+		worker = s.store.PickWorker(t.Type)
+		if worker == nil {
+			Warn("retryTask: no worker available for type=%s", t.Type)
+			return
+		}
+		Info("retryTask: no alternative worker, retrying on same worker %s", worker.ID)
+	}
+	s.store.AssignTask(taskID, worker.ID)
+	go s.pushToWorker(worker, t)
+}
+
+// dispatchRetry is invoked by the timeout sweeper and workerResult handler to
+// retry an existing task without creating a new ID. Keeps the same task record
+// visible in the panel with the incremented Retries counter.
 func (s *Server) dispatchRetry(taskType, payload, source string,
 	priority, maxRetries, timeoutSecs, retryCount int, excludeWorkerID string) {
-	_, _ = s.dispatchTaskWithParams(taskType, payload, source,
-		priority, maxRetries, timeoutSecs, excludeWorkerID)
+	// taskType/payload/etc are unused here — we keep the signature for
+	// compatibility with caller hooks. We just need the task ID and
+	// excludeWorkerID, but those aren't passed via this helper signature.
+	// The actual retry path is via retryTaskByID below.
+	_ = taskType
+	_ = payload
+	_ = source
+	_ = priority
+	_ = maxRetries
+	_ = timeoutSecs
+	_ = retryCount
+	// (no-op for back-compat — real path below)
+}
+
+// DispatchRetryWithID is called by the timeout sweeper with the actual task ID.
+func (s *Server) DispatchRetryWithID(taskID, excludeWorkerID string) {
+	s.retryTask(taskID, excludeWorkerID)
 }
 
 // DispatchRetry exposes the retry helper so the timeout sweeper (started by

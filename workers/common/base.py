@@ -32,6 +32,42 @@ DEFAULT_RESTART_AFTER_TASKS = int(os.environ.get("WORKER_RESTART_AFTER_TASKS", "
 DEFAULT_TIMEOUT_DEFAULT = int(os.environ.get("WORKER_TASK_TIMEOUT", "300"))
 
 
+class TaskCancelled(Exception):
+    """Raised inside a task function when cancellation has been requested.
+
+    The executor catches this and reports the task as failed with
+    error='cancelled' so the gateway can decide whether to retry or give up.
+    """
+    pass
+
+
+def cancellable_sleep(seconds: float, cancel_event: Optional[threading.Event],
+                      step: float = 0.5) -> None:
+    """Sleep that wakes up early when cancellation is requested.
+
+    Splits the sleep into 0.5s slices and exits as soon as cancel_event is set.
+    Use this in place of time.sleep in long-running loops so a task can be
+    killed in <1s instead of waiting for the full sleep to complete.
+    """
+    if cancel_event is None or seconds <= 0:
+        return
+    end = time.time() + seconds
+    while time.time() < end:
+        if cancel_event.is_set():
+            raise TaskCancelled("cancelled during sleep")
+        time.sleep(min(step, end - time.time()))
+
+
+def check_cancel(cancel_event: Optional[threading.Event], label: str = "") -> None:
+    """Raise TaskCancelled immediately if cancellation has been requested.
+
+    Place at the top of each loop iteration in user task functions to ensure
+    timely cancellation. Cheap to call when cancel_event is None (no-op).
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise TaskCancelled(f"cancelled{' at ' + label if label else ''}")
+
+
 def _stable_worker_id(port: int, worker_type: str) -> str:
     """Resolve a stable worker ID.
 
@@ -148,22 +184,46 @@ class BaseWorker:
             self._cancel_event = cancel_event
         reporter = Reporter(self.gateway, self.worker_id, lambda: self.current_task_id)
         reporter.start()
+
+        # Schedule watchdog: after DEFAULT_TIMEOUT_DEFAULT seconds, force the
+        # cancel_event so cooperative task functions have a chance to abort.
+        # Tasks must call check_cancel() or cancellable_sleep() to honor this.
+        watchdog = threading.Timer(DEFAULT_TIMEOUT_DEFAULT, cancel_event.set)
+        watchdog.daemon = True
+        watchdog.start()
+
+        start_ts = time.time()
         try:
             reporter.progress(1, f"[{task_type}] start")
             result = fn(task_id, payload, reporter, cancel_event) or {}
+            elapsed = time.time() - start_ts
             if cancel_event.is_set():
-                log.info("task %s cancelled mid-execution", task_id)
-                reporter.progress(100, f"[{task_type}] cancelled")
-                post_result(self.gateway, self.worker_id, task_id, {},
-                            success=False, error="cancelled by gateway")
+                if elapsed >= DEFAULT_TIMEOUT_DEFAULT * 0.95:
+                    # watchdog fired and task honored it
+                    log.warning("task %s aborted by watchdog after %.1fs", task_id, elapsed)
+                    reporter.progress(100, f"[{task_type}] cancelled by watchdog")
+                    post_result(self.gateway, self.worker_id, task_id, {},
+                                success=False, error="task timed out (watchdog fired)")
+                else:
+                    # gateway-side cancel arrived
+                    log.info("task %s cancelled by gateway after %.1fs", task_id, elapsed)
+                    reporter.progress(100, f"[{task_type}] cancelled")
+                    post_result(self.gateway, self.worker_id, task_id, {},
+                                success=False, error="cancelled by gateway")
             else:
                 reporter.progress(100, f"[{task_type}] done")
                 post_result(self.gateway, self.worker_id, task_id, result, success=True)
+        except TaskCancelled as e:
+            log.info("task %s cancelled: %s", task_id, e)
+            reporter.progress(100, f"[{task_type}] cancelled: {e}")
+            post_result(self.gateway, self.worker_id, task_id, {},
+                        success=False, error=f"cancelled: {e}")
         except Exception as e:
             log.exception("task %s failed", task_id)
             reporter.progress(100, f"[{task_type}] failed: {e}")
             post_result(self.gateway, self.worker_id, task_id, {}, success=False, error=str(e))
         finally:
+            watchdog.cancel()
             reporter.stop()
             with self._lock:
                 if self.current_task_id == task_id:

@@ -10,7 +10,11 @@ using imageio-ffmpeg for H.264 encoding. Works without a GPU.
 """
 import json
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.base import TaskCancelled  # noqa: E402
 
 import imageio.v2 as imageio
 import numpy as np
@@ -76,6 +80,8 @@ def assemble_clip(task_id, payload, reporter, cancel_event=None):
     frames = []
     for i, scene in enumerate(scenes):
         for f in range(n_per):
+            if cancel_event and cancel_event.is_set():
+                raise TaskCancelled(f"clip cancelled at scene {i+1} frame {f+1}/{n_per}")
             t = f / max(n_per - 1, 1)
             frames.append(_frame(i, scene, t, 1.0))
         reporter.progress(20 + 70 * (i + 1) // max(len(scenes), 1),
@@ -115,6 +121,8 @@ def kenburns(task_id, payload, reporter, cancel_event=None):
 
     frames = []
     for i in range(nframes):
+        if cancel_event and cancel_event.is_set():
+            raise TaskCancelled(f"kenburns cancelled at frame {i+1}/{nframes}")
         t = i / max(nframes - 1, 1)
         scale = 1.0 + 0.5 * t
         cw = int(src_w / scale)

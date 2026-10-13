@@ -1,8 +1,13 @@
 """Doc worker task implementations — text summarization and word frequency."""
 import math
+import os
 import re
+import sys
 import time
 from collections import Counter
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.base import TaskCancelled, cancellable_sleep  # noqa: E402
 
 
 # --- simple Chinese-friendly sentence splitter ---
@@ -60,7 +65,8 @@ def sentence_similarity(s1: str, s2: str) -> float:
     return len(t1 & t2) / math.sqrt(len(t1) * len(t2))
 
 
-def textrank(sentences: list[str], top_n: int = 3, damping: float = 0.85, iters: int = 30) -> list[str]:
+def textrank(sentences: list[str], top_n: int = 3, damping: float = 0.85, iters: int = 30,
+             cancel_event=None) -> list[str]:
     """Simplified TextRank: build similarity matrix, run PageRank, pick top_n."""
     n = len(sentences)
     if n == 0:
@@ -78,7 +84,9 @@ def textrank(sentences: list[str], top_n: int = 3, damping: float = 0.85, iters:
 
     # initial score
     score = [1.0] * n
-    for _ in range(iters):
+    for it in range(iters):
+        if cancel_event and cancel_event.is_set():
+            raise TaskCancelled(f"textrank cancelled at iteration {it}/{iters}")
         new_score = [0.0] * n
         for i in range(n):
             s = 0.0
@@ -102,17 +110,17 @@ def textrank(sentences: list[str], top_n: int = 3, damping: float = 0.85, iters:
 def summarize(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     """Generate a TextRank-style extractive summary."""
     reporter.progress(10, "[summary] 分句")
-    time.sleep(0.2)
+    cancellable_sleep(0.2, cancel_event)
     sentences = split_sentences(payload)
     if not sentences:
         return {"success": False, "error": "no sentences found"}
     reporter.progress(30, f"[summary] 共 {len(sentences)} 句")
-    time.sleep(0.2)
+    cancellable_sleep(0.2, cancel_event)
 
     top_n = max(1, min(5, max(1, len(sentences) // 4)))
     reporter.progress(50, f"[summary] TextRank 抽取 top-{top_n}")
-    time.sleep(0.2)
-    summary = textrank(sentences, top_n=top_n)
+    cancellable_sleep(0.2, cancel_event)
+    summary = textrank(sentences, top_n=top_n, cancel_event=cancel_event)
 
     reporter.progress(90, "[summary] 完成")
     return {
@@ -127,12 +135,12 @@ def summarize(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
 def wordfreq(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     """Compute top-N word/bigram frequencies."""
     reporter.progress(15, "[wordfreq] 分词")
-    time.sleep(0.2)
+    cancellable_sleep(0.2, cancel_event)
     tokens = tokenize(payload)
     if not tokens:
         return {"success": False, "error": "no tokens"}
     reporter.progress(50, f"[wordfreq] 共 {len(tokens)} token")
-    time.sleep(0.2)
+    cancellable_sleep(0.2, cancel_event)
     counter = Counter(tokens)
     top = counter.most_common(20)
     reporter.progress(95, "[wordfreq] 完成")

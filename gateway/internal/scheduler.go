@@ -122,18 +122,18 @@ func (s *Store) StartOfflineSweeper(timeout, interval time.Duration) {
 
 // StartTimeoutSweeper fails running tasks whose StartedAt + TimeoutSecs is past.
 // Re-dispatches retriable tasks to the next-best worker.
-func (s *Store) StartTimeoutSweeper(interval time.Duration, dispatchRetry func(taskType, payload, source string, priority, maxRetries, timeoutSecs, retryCount int, excludeWorkerID string)) {
+func (s *Store) StartTimeoutSweeper(interval time.Duration, dispatchRetryWithID func(taskID, excludeWorkerID string)) {
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for range t.C {
 			retriable := s.SweepTimeouts(0) // 0 = use per-task TimeoutSecs
-			for _, t := range retriable {
-				if s.RetryTask(t.ID) {
-					Info("task %s retrying (%d/%d) after timeout on worker %s",
-						t.ID, t.Retries+1, t.MaxRetries, t.WorkerID)
-					dispatchRetry(t.Type, t.Payload, t.Source,
-						t.Priority, t.MaxRetries, t.TimeoutSecs, t.Retries+1, t.WorkerID)
+			for _, task := range retriable {
+				failedOn := task.WorkerID // capture before RetryTask clears it
+				if s.RetryTask(task.ID) {
+					Info("task %s retrying (now=%d, max=%d) after timeout on worker %s",
+						task.ID, task.Retries, task.MaxRetries, failedOn)
+					dispatchRetryWithID(task.ID, failedOn)
 				}
 			}
 		}

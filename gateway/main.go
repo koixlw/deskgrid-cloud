@@ -74,7 +74,7 @@ func main() {
 	engine := srv.Engine()
 
 	// Timeout sweeper dispatches retries via the server's helper.
-	store.StartTimeoutSweeper(15*time.Second, srv.DispatchRetry)
+	store.StartTimeoutSweeper(15*time.Second, srv.DispatchRetryWithID)
 
 	// serve embedded web/
 	if sub, err := fs.Sub(webFS, "web"); err == nil {

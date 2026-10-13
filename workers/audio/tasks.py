@@ -11,9 +11,13 @@ end-to-end without any model download.
 """
 import json
 import os
+import sys
 import time
 import wave
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.base import cancellable_sleep  # noqa: E402
 
 import numpy as np
 
@@ -74,7 +78,7 @@ def tts_line(task_id, payload, reporter, cancel_event=None):
         text = "hello world"
 
     reporter.progress(25, f"[tts] text='{text[:40]}'")
-    time.sleep(0.2)
+    cancellable_sleep(0.2, cancel_event)
     samples = _speak(text)
     reporter.progress(70, f"[tts] rendered {len(samples)/SAMPLE_RATE:.2f}s audio")
 
@@ -101,7 +105,7 @@ def tts_with_emotion(task_id, payload, reporter, cancel_event=None):
     }
     base = pitch_map.get(emotion, 180)
     reporter.progress(30, f"[tts-emo] emotion={emotion} base_pitch={base}Hz")
-    time.sleep(0.2)
+    cancellable_sleep(0.2, cancel_event)
     samples = _speak(text, base_pitch=base)
 
     out = OUTPUT_DIR / f"tts_emo_{task_id[:8]}.wav"

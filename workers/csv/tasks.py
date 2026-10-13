@@ -1,8 +1,12 @@
 """CSV worker task implementations — Monte Carlo simulation and descriptive stats."""
 import json
 import math
+import os
 import random
+import sys
 import time
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.base import TaskCancelled  # noqa: E402
 
 
 def _parse_numbers(payload: str) -> list[float]:
@@ -60,6 +64,8 @@ def montecarlo(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     if dist == "uniform":
         lo, hi = float(config["low"]), float(config["high"])
         for i in range(n):
+            if cancel_event and cancel_event.is_set():
+                raise TaskCancelled(f"montecarlo uniform cancelled at {i}/{n}")
             samples.append(random.uniform(lo, hi))
             if (i + 1) % chunk == 0:
                 pct = 15 + int(70 * (i + 1) / n)
@@ -67,6 +73,8 @@ def montecarlo(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     elif dist == "normal":
         mu, sigma = float(config["mean"]), max(1e-9, float(config["stddev"]))
         for i in range(n):
+            if cancel_event and cancel_event.is_set():
+                raise TaskCancelled(f"montecarlo normal cancelled at {i}/{n}")
             samples.append(random.gauss(mu, sigma))
             if (i + 1) % chunk == 0:
                 pct = 15 + int(70 * (i + 1) / n)
@@ -74,6 +82,8 @@ def montecarlo(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     elif dist == "exponential":
         rate = max(1e-9, float(config["rate"]))
         for i in range(n):
+            if cancel_event and cancel_event.is_set():
+                raise TaskCancelled(f"montecarlo exp cancelled at {i}/{n}")
             samples.append(random.expovariate(rate))
             if (i + 1) % chunk == 0:
                 pct = 15 + int(70 * (i + 1) / n)

@@ -11,8 +11,12 @@ works without requiring a GPU or large model download.
 """
 import colorsys
 import os
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.base import cancellable_sleep  # noqa: E402
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -101,9 +105,9 @@ def txt2img(task_id, payload, reporter, cancel_event=None):
     steps = int(p.get("steps", 20))
 
     reporter.progress(15, f"[txt2img] prompt='{prompt[:60]}'")
-    time.sleep(0.2)
+    cancellable_sleep(0.2, cancel_event)
     reporter.progress(30, "[txt2img] load model (stub)")
-    time.sleep(0.3)
+    cancellable_sleep(0.3, cancel_event)
     reporter.progress(50, f"[txt2img] sample {steps} steps (stub)")
 
     hue = abs(hash(prompt)) % 360
@@ -124,7 +128,7 @@ def txt2img(task_id, payload, reporter, cancel_event=None):
 
     out = OUTPUT_DIR / f"txt2img_{task_id[:8]}.png"
     img.save(out, "PNG", optimize=True)
-    time.sleep(0.1)
+    cancellable_sleep(0.1, cancel_event)
     reporter.progress(100, "[txt2img] done")
     return {
         "image_path": str(out),
