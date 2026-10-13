@@ -50,6 +50,7 @@ func main() {
 		persistence.OnEvent(event, payload)
 	})
 	store.StartOfflineSweeper(6*time.Second, 2*time.Second)
+	store.StartCleanupLoop(5 * time.Minute)
 	defer persistence.Stop()
 
 	// Restore previous state from disk, then settle in-flight tasks.

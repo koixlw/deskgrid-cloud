@@ -244,7 +244,7 @@ func (s *Server) workerResult(c *gin.Context) {
 		return
 	}
 	if req.Success {
-		s.store.FinishTask(req.TaskID, req.Result, "", true)
+		s.store.FinishTask(req.TaskID, TruncateResult(req.Result), "", true)
 		s.store.RecordTaskResult(id, true)
 	} else {
 		s.store.FinishTask(req.TaskID, "", req.Error, false)
