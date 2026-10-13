@@ -1,6 +1,7 @@
 """Audio worker entry point (port 3005)."""
 import logging
 import os
+WORKER_HOST = os.environ.get("WORKER_HOST", "127.0.0.1")
 import sys
 
 import uvicorn
@@ -33,4 +34,4 @@ worker.register()
 worker.start_heartbeat()
 
 if __name__ == "__main__":
-    uvicorn.run(worker.app, host="0.0.0.0", port=PORT, log_level="warning")
+    uvicorn.run(worker.app, host=os.environ.get("WORKER_HOST", "127.0.0.1"), port=PORT, log_level="warning")

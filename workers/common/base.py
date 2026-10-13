@@ -20,7 +20,6 @@ import json as _json_mod
 import logging
 import multiprocessing
 import os
-import socket
 import sys
 import threading
 import time
@@ -31,7 +30,8 @@ from typing import Callable, Optional
 import psutil
 import requests
 import urllib3
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from .hardware import collect as collect_hw, snapshot_usage
 
@@ -41,6 +41,16 @@ log = logging.getLogger("worker")
 DEFAULT_HEARTBEAT_INTERVAL = float(os.environ.get("WORKER_HEARTBEAT_INTERVAL", "3"))
 DEFAULT_RESTART_AFTER_TASKS = int(os.environ.get("WORKER_RESTART_AFTER_TASKS", "500"))
 DEFAULT_TIMEOUT_DEFAULT = int(os.environ.get("WORKER_TASK_TIMEOUT", "300"))
+# Worker bind address. Default 127.0.0.1 (safer; only local gateway reaches us).
+# Override with WORKER_HOST=0.0.0.0 to allow other machines on the LAN to
+# reach us — but then anyone on the network can submit tasks if they know
+# the HMAC secret.
+WORKER_HOST = os.environ.get("WORKER_HOST", "127.0.0.1")
+# Sandbox: restrict subprocess to a specific cwd. Default = project_root/artifacts.
+SANDBOX_ARTIFACTS_DIR = os.environ.get(
+    "WORKER_SANDBOX_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "artifacts"),
+)
 
 
 # HMAC support: workers sign requests with shared secret.
@@ -48,7 +58,9 @@ HMAC_SECRET = os.environ.get("GATEWAY_HMAC_SECRET", "").encode()
 INSECURE_SKIP_TLS = os.environ.get("INSECURE_SKIP_TLS_VERIFY", "0") == "1"
 
 if HMAC_SECRET:
-    log.info("HMAC signing ENABLED (shared secret set)")
+    import hashlib
+    log.info("HMAC signing ENABLED (shared secret set, sha256=%s)",
+             hashlib.sha256(HMAC_SECRET).hexdigest()[:12])
 if INSECURE_SKIP_TLS:
     log.warning("INSECURE_SKIP_TLS_VERIFY=1: not verifying TLS certificate (demo only)")
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -64,12 +76,7 @@ def _sign_request(body: bytes, ts: int) -> str:
 
 
 def signed_post(url: str, payload: dict, timeout: float = 5):
-    """POST payload to gateway, optionally HMAC-signed.
-
-    When HMAC_SECRET is set we serialize the body ourselves, sign it, and
-    send with X-Signature and X-Timestamp headers. When unset we fall back
-    to the simpler requests.post(json=...) call.
-    """
+    """POST payload to gateway, optionally HMAC-signed."""
     if not HMAC_SECRET:
         return requests.post(url, json=payload, timeout=timeout, verify=not INSECURE_SKIP_TLS)
     body = _json_mod.dumps(payload, ensure_ascii=False).encode()
@@ -81,6 +88,23 @@ def signed_post(url: str, payload: dict, timeout: float = 5):
         "X-Timestamp": str(ts),
     }
     return requests.post(url, data=body, headers=headers, timeout=timeout, verify=not INSECURE_SKIP_TLS)
+
+
+def _verify_request(body: bytes, signature: str, ts_str: str, max_skew_sec: int = 300) -> bool:
+    """Verify an HMAC-signed request. Returns True if valid."""
+    if not HMAC_SECRET:
+        return True  # dev mode, no HMAC required
+    if not signature or not ts_str:
+        return False
+    try:
+        ts = int(ts_str)
+    except (ValueError, TypeError):
+        return False
+    now = int(time.time())
+    if abs(now - ts) > max_skew_sec:
+        return False
+    expected = _sign_request(body, ts)
+    return hmac.compare_digest(expected, signature.lower())
 
 
 class TaskCancelled(Exception):
@@ -146,10 +170,12 @@ def _read_gpu_info() -> tuple[int, int]:
 def _task_subprocess_entry(gateway: str, worker_id: str, task_id: str, task_type: str,
                            payload, fn_bytes: bytes, cancel_event):
     """Runs in a fresh subprocess. Picks up the task function from its module
-    path (fn_bytes) and executes it. Posts result to gateway directly so we
-    don't need a separate Reporter instance in the parent process.
+    path (fn_bytes) and executes it. Posts result to gateway directly.
 
-    This function is at module level so multiprocessing.Process can pickle it.
+    This function applies a sandbox before executing the user task:
+      - chdir to a restricted directory (default artifacts/)
+      - clear sensitive env vars (USERPROFILE, APPDATA, ...)
+      - on Linux, apply rlimit for CPU and memory
     """
     import importlib
     import json as _json
@@ -161,6 +187,40 @@ def _task_subprocess_entry(gateway: str, worker_id: str, task_id: str, task_type
     _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _project_root not in _sys.path:
         _sys.path.insert(0, _project_root)
+
+    # ---------- SANDBOX ----------
+    try:
+        os.makedirs(SANDBOX_ARTIFACTS_DIR, exist_ok=True)
+        os.chdir(SANDBOX_ARTIFACTS_DIR)
+    except Exception:
+        pass
+    # Drop env vars that could leak user data or expand attack surface
+    for k in [
+        "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH",
+        "USERNAME", "USERDOMAIN", "SESSIONNAME", "LOGONSERVER",
+        "ALLUSERSPROFILE", "PROGRAMDATA", "COMMONPROGRAMWISES", "WINDIR",
+        "PYTHONPATH",  # already set sys.path explicitly
+    ]:
+        os.environ.pop(k, None)
+    # Strip PATH to system dirs only (prevent running arbitrary user-installed exe)
+    if sys.platform == "win32":
+        os.environ["PATH"] = r"C:\Windows\System32;C:\Windows"
+    else:
+        os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+    # Resource limits (Linux only; resource module doesn't exist on Windows)
+    try:
+        import resource
+        # soft=120s CPU, hard=130s (slightly past)
+        resource.setrlimit(resource.RLIMIT_CPU, (120, 130))
+        # 1GB address space (most ML fits; hard=1.2GB to allow fork/exec)
+        resource.setrlimit(resource.RLIMIT_AS, (1_073_741_824, 1_200_000_000))
+        # 256MB stack to avoid stack overflow attacks
+        resource.setrlimit(resource.RLIMIT_STACK, (64 * 1024 * 1024, 256 * 1024 * 1024))
+    except ImportError:
+        pass  # Windows
+    except Exception:
+        pass
 
     info = _json.loads(fn_bytes.decode())
     mod = importlib.import_module(info["module"])
@@ -239,6 +299,34 @@ class BaseWorker:
         self._mp_ctx = multiprocessing.get_context("spawn")
 
         self._register_routes()
+        self._verify_hmac_middleware()
+
+    # ---------- HMAC middleware ----------
+    def _verify_hmac_middleware(self):
+        """Reject any request whose HMAC signature doesn't match.
+
+        Skipped when HMAC_SECRET is empty (backward-compatible with dev).
+        Health endpoint stays open so healthchecks keep working.
+        """
+        if not HMAC_SECRET:
+            return  # dev mode
+        secret = HMAC_SECRET
+
+        @self.app.middleware("http")
+        async def _hmac_check(request: Request, call_next):
+            # Allow unauthenticated probes so monitor-side polling still works
+            if request.url.path in ("/health",):
+                return await call_next(request)
+            # Body must be read for signing — FastAPI caches it so handlers can re-read
+            body = await request.body()
+            sig = request.headers.get("X-Signature", "")
+            ts = request.headers.get("X-Timestamp", "")
+            if not _verify_request(body, sig, ts):
+                return JSONResponse(
+                    {"error": "invalid or missing HMAC signature"},
+                    status_code=401,
+                )
+            return await call_next(request)
 
     # ---------- FastAPI routes ----------
     def _register_routes(self):

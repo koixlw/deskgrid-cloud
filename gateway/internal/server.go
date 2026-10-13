@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,6 +44,9 @@ func NewServer(store *Store, hub *Hub, token string) *Server {
 	s.routes()
 	return s
 }
+
+// hmacSecret returns the secret so pushToWorker / pushCancel can sign.
+func (s *Server) HMAC() []byte { return s.hmacSecret }
 
 func (s *Server) Engine() *gin.Engine { return s.engine }
 
@@ -506,9 +510,22 @@ func (s *Server) pushToWorker(w *Worker, t *Task) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := workerHTTP.Do(req)
+	// Sign request body with HMAC so the worker can verify the request came
+	// from this gateway (and not an attacker on the LAN).
+	var resp *http.Response
+	var err error
+	if s.hmacSecret != nil {
+		req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		ts := time.Now().Unix()
+		req.Header.Set("X-Timestamp", strconv.FormatInt(ts, 10))
+		req.Header.Set("X-Signature", SignRequest(s.hmacSecret, body, ts))
+		resp, err = workerHTTP.Do(req)
+	} else {
+		req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err = workerHTTP.Do(req)
+	}
 	if err != nil {
 		errMsg := fmt.Sprintf("push to worker failed: %v", err)
 		Errorf("%s task=%s", errMsg, t.ID)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"embed"
 	"io/fs"
 	"net/http"
@@ -143,7 +144,9 @@ func main() {
 	tlsCert := envOr("GATEWAY_TLS_CERT", "")
 	tlsKey := envOr("GATEWAY_TLS_KEY", "")
 	if HMAC_SECRET := envOr("GATEWAY_HMAC_SECRET", ""); HMAC_SECRET != "" {
-		internal.Info("HMAC worker auth ENABLED")
+		// Log first 12 chars of sha256 to compare with worker logs
+		sum := sha256.Sum256([]byte(HMAC_SECRET))
+		internal.Info("HMAC worker auth ENABLED (sha256=%x)", sum[:6])
 	} else {
 		internal.Info("HMAC worker auth disabled (GATEWAY_HMAC_SECRET unset)")
 	}

@@ -175,6 +175,10 @@ def start_worker(name: str, script_rel: str, port: int, gateway_urls: list[str])
     env = os.environ.copy()
     env["PORT"] = str(port)
     env["GATEWAY"] = ",".join(gateway_urls)
+    # Worker host binding: default 127.0.0.1 (only local gateway). Override to
+    # 0.0.0.0 only when workers and gateway are on different machines and you
+    # have firewall rules + HMAC enabled (worker verifies gateway's HMAC).
+    env.setdefault("WORKER_HOST", "127.0.0.1")
     return start_process(
         [sys.executable, script],
         ROOT, env,

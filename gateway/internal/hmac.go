@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -54,6 +55,23 @@ func (e *hmacError) Error() string { return e.msg }
 
 func errBadRequest(msg string) error  { return &hmacError{400, msg} }
 func errUnauthorized(msg string) error { return &hmacError{401, msg} }
+
+// SignedPost signs the body with HMAC and adds the timestamp/signature
+// headers before posting. Used by the gateway when pushing tasks to workers
+// so workers can verify the request is from the gateway.
+func SignedPost(secret []byte, url string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, io.NopCloser(strings.NewReader(string(body))))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if len(secret) > 0 {
+		ts := time.Now().Unix()
+		req.Header.Set("X-Timestamp", strconv.FormatInt(ts, 10))
+		req.Header.Set("X-Signature", SignRequest(secret, body, ts))
+	}
+	return workerHTTP.Do(req)
+}
 
 // HMACMiddleware enforces request signing on routes that need it. If the
 // gateway secret is empty (dev mode), all requests pass.
