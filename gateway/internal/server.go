@@ -53,28 +53,48 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
+// Per-route request body size limits. Anything larger is rejected before
+// being parsed, preventing OOM from a single huge payload. Values are tuned
+// to the realistic maximum for each endpoint:
+//
+//   register/heartbeat/progress: 16 KB (json of CPU/Mem stats)
+//   result: 16 MB (image/audio/video task results may embed small files)
+//   cancel: 1 KB (just a task id)
+//   task create: 64 KB (includes payload string)
+//   v1/chat/completions: 64 KB (whole conversation)
+//
+// On overflow, http.MaxBytesReader returns "request body too large" which the
+// downstream handler surfaces as a 400 response. The protection is enforced
+// regardless of status code.
+func bodyLimit(maxBytes int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+		c.Next()
+	}
+}
+
 func (s *Server) routes() {
 	api := s.engine.Group("/api")
 	{
 		api.GET("/auth-check", s.authCheck)
 		api.GET("/workers", s.listWorkers)
 		api.GET("/workers/:id", s.getWorker)
-		api.POST("/workers/register", s.registerWorker)
+		api.POST("/workers/register", bodyLimit(16*1024), s.registerWorker)
 		api.DELETE("/workers/:id", s.deleteWorker)
-		api.POST("/workers/:id/heartbeat", s.heartbeat)
-		api.POST("/workers/:id/progress", s.workerProgress)
-		api.POST("/workers/:id/result", s.workerResult)
-		api.POST("/workers/:id/task/cancel", s.cancelTask)
+		api.POST("/workers/:id/heartbeat", bodyLimit(16*1024), s.heartbeat)
+		api.POST("/workers/:id/progress", bodyLimit(16*1024), s.workerProgress)
+		api.POST("/workers/:id/result", bodyLimit(16*1024*1024), s.workerResult)
+		api.POST("/workers/:id/task/cancel", bodyLimit(1024), s.cancelTask)
 
 		api.GET("/tasks", s.listTasks)
 		api.GET("/tasks/:id", s.getTask)
-		api.POST("/tasks", s.createTask)
+		api.POST("/tasks", bodyLimit(64*1024), s.createTask)
 	}
 
 	s.engine.GET("/ws", func(c *gin.Context) { s.hub.HandleWS(c.Writer, c.Request) })
 
 	// OpenAI-compatible endpoint
-	s.engine.POST("/v1/chat/completions", s.handleChatCompletions)
+	s.engine.POST("/v1/chat/completions", bodyLimit(64*1024), s.handleChatCompletions)
 	s.engine.GET("/v1/models", s.listModels)
 
 	s.engine.GET("/health", func(c *gin.Context) {
@@ -399,6 +419,19 @@ func (s *Server) DispatchRetry(taskType, payload, source string,
 	s.dispatchRetry(taskType, payload, source, priority, maxRetries, timeoutSecs, retryCount, excludeWorkerID)
 }
 
+// Shared HTTP client with a connection pool. Using http.DefaultClient creates
+// a fresh TCP connection per request, which on busy clusters exhausts file
+// descriptors under load. The pool keeps idle keep-alive connections.
+var workerHTTP = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+	},
+}
+
 // pushCancelToWorker tells a worker to abort a specific task. Best-effort:
 // if the worker is unreachable we still leave the cancel flag in the store so
 // the gateway side tracks it correctly.
@@ -413,7 +446,7 @@ func (s *Server) pushCancelToWorker(workerID, taskID string) {
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := workerHTTP.Do(req)
 	if err != nil {
 		Warn("cancel push failed worker=%s task=%s: %v", workerID, taskID, err)
 		return
@@ -432,7 +465,7 @@ func (s *Server) pushToWorker(w *Worker, t *Task) {
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := workerHTTP.Do(req)
 	if err != nil {
 		errMsg := fmt.Sprintf("push to worker failed: %v", err)
 		Errorf("%s task=%s", errMsg, t.ID)
