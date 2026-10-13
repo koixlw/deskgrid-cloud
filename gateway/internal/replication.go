@@ -2,23 +2,28 @@ package internal
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
 
 // PeerSync replicates worker state between gateway instances so a second
 // gateway can take over when the first one fails. Set GATEWAY_PEERS to a
-// comma-separated list of peer URLs (e.g. "http://gw-b:13000,http://gw-c:13000").
+// comma-separated list of peer URLs (e.g. "http://gw-b:13000,https://gw-c:13000").
 //
 // On worker state changes (register/heartbeat update/offline/removed) we
 // POST the change to every peer. Peers replay on their own store.
 //
 // Task state is ephemeral and NOT replicated — when a gateway dies, any
 // in-flight task is lost. Workers re-register on failover and the new
-// gateway starts with an empty task list. This is acceptable for a demo
-// and matches the typical "stateless gateway" HA design.
+// gateway starts with an empty task list.
+//
+// For self-signed TLS certs on the peer, PeerSync skips verification
+// (peer URLs are internal network, not internet). Set GATEWAY_PEER_VERIFY=1
+// to require valid certs.
 type PeerSync struct {
 	mu      sync.Mutex
 	peers   []string
@@ -37,9 +42,15 @@ func NewPeerSync(peersCSV string) *PeerSync {
 			peers = append(peers, s)
 		}
 	}
+	// Skip TLS verification on peer URLs unless explicitly required. Peer
+	// communications happen on the internal network where MITM is unlikely.
+	verify := os.Getenv("GATEWAY_PEER_VERIFY") == "1"
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: !verify},
+	}
 	return &PeerSync{
 		peers:   peers,
-		client:  &http.Client{Timeout: 2 * time.Second},
+		client:  &http.Client{Timeout: 2 * time.Second, Transport: transport},
 		enabled: len(peers) > 0,
 	}
 }
@@ -63,11 +74,11 @@ func (p *PeerSync) BroadcastEvent(event string, payload interface{}) {
 		return
 	}
 	for _, peer := range p.peers {
-		go p.sendTo(peer, body)
+		go p.sendTo(peer, event, body)
 	}
 }
 
-func (p *PeerSync) sendTo(peer string, body []byte) {
+func (p *PeerSync) sendTo(peer, event string, body []byte) {
 	url := peer + "/api/peer-replicate"
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
@@ -76,11 +87,10 @@ func (p *PeerSync) sendTo(peer string, body []byte) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := p.client.Do(req)
 	if err != nil {
-		// peer may be down — silent retry on next event
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		Warn("peer sync: %s returned %d", url, resp.StatusCode)
+		Warn("peer sync: %s POST %s returned %d", url, event, resp.StatusCode)
 	}
 }

@@ -1,7 +1,8 @@
 @echo off
-REM run_gateway.cmd — 由 Task Scheduler 调用的网关启动包装器
-REM 输出重定向到 logs\gateway.out.log，崩溃退出后由 watchdog 拉起
+REM run_gateway.cmd - generic gateway launcher
+REM Picks up env vars from caller (HMAC, TLS, PEERS, etc.).
 setlocal
 cd /d E:\deskgrid-cloud
 if not exist logs mkdir logs
-bin\gateway.exe >> logs\gateway.out.log 2>&1
+REM Pass through all env; the gateway reads GATEWAY_* directly.
+bin\gateway.exe >> logs\gateway.log 2>&1
