@@ -1,19 +1,27 @@
 """BaseWorker - common scaffolding for code/doc/csv/image/audio/video workers.
 
+Architecture note:
+Each task runs in a SEPARATE PROCESS (multiprocessing.Process), not a thread.
+This solves the Python GIL: heavy CPU tasks (image generation, video encoding)
+no longer block the FastAPI server thread, the heartbeat thread, or progress
+reporting. Each task can also be hard-killed by the watchdog if it exceeds
+the timeout, regardless of whether it's stuck in a tight C extension.
+
 Includes:
 - Stable worker ID: WORKER_ID env > hostname > MAC hash > random UUID
 - Faster heartbeat (3s) with GPU usage reporting
-- Cooperative cancellation: /task/cancel closes a channel the executor polls
-- Periodic self-restart after N tasks (prevents Python memory leaks)
-- Real /hardware/fd stability tracking via the gateway
+- Cooperative cancellation via multiprocessing.Event
+- Watchdog: hard-kill (terminate()) subprocess after TaskTimeoutSecs
+- Periodic self-restart after N tasks (prevent Python memory leaks)
 """
 import logging
+import multiprocessing
 import os
-import platform
 import socket
-import subprocess
+import sys
 import threading
 import time
+import traceback
 import uuid
 from typing import Callable, Optional
 
@@ -22,7 +30,6 @@ import requests
 from fastapi import FastAPI, HTTPException
 
 from .hardware import collect as collect_hw, snapshot_usage
-from .reporter import Reporter, post_result
 
 log = logging.getLogger("worker")
 
@@ -33,21 +40,16 @@ DEFAULT_TIMEOUT_DEFAULT = int(os.environ.get("WORKER_TASK_TIMEOUT", "300"))
 
 
 class TaskCancelled(Exception):
-    """Raised inside a task function when cancellation has been requested.
-
-    The executor catches this and reports the task as failed with
-    error='cancelled' so the gateway can decide whether to retry or give up.
-    """
+    """Raised inside a task function when cancellation has been requested."""
     pass
 
 
-def cancellable_sleep(seconds: float, cancel_event: Optional[threading.Event],
-                      step: float = 0.5) -> None:
+def cancellable_sleep(seconds: float, cancel_event, step: float = 0.5) -> None:
     """Sleep that wakes up early when cancellation is requested.
 
-    Splits the sleep into 0.5s slices and exits as soon as cancel_event is set.
-    Use this in place of time.sleep in long-running loops so a task can be
-    killed in <1s instead of waiting for the full sleep to complete.
+    Works with both threading.Event (in-process) and multiprocessing.Event
+    (cross-process). For multiprocessing.Event, is_set() is a syscall, so we
+    keep step small.
     """
     if cancel_event is None or seconds <= 0:
         return
@@ -58,28 +60,15 @@ def cancellable_sleep(seconds: float, cancel_event: Optional[threading.Event],
         time.sleep(min(step, end - time.time()))
 
 
-def check_cancel(cancel_event: Optional[threading.Event], label: str = "") -> None:
-    """Raise TaskCancelled immediately if cancellation has been requested.
-
-    Place at the top of each loop iteration in user task functions to ensure
-    timely cancellation. Cheap to call when cancel_event is None (no-op).
-    """
+def check_cancel(cancel_event, label: str = "") -> None:
+    """Raise TaskCancelled immediately if cancellation has been requested."""
     if cancel_event is not None and cancel_event.is_set():
         raise TaskCancelled(f"cancelled{' at ' + label if label else ''}")
 
 
 def _stable_worker_id(port: int, worker_type: str) -> str:
-    """Resolve a stable worker ID.
-
-    Priority:
-      1. WORKER_ID env var (explicit override, e.g. for fixed-name workers)
-      2. hostname + worker_type + port (stable, distinguishes same-host workers)
-      3. MAC address hash (survives hostname changes)
-      4. random UUID (last resort - identity won't survive restart)
-
-    Including type+port is critical: multiple workers on the same host must
-    have distinct IDs or they'll keep clobbering each other in the store.
-    """
+    """Resolve a stable worker ID. Includes type+port so multiple workers on the
+    same host get distinct IDs."""
     explicit = os.environ.get("WORKER_ID")
     if explicit:
         return f"fixed:{explicit}"
@@ -99,19 +88,81 @@ def _stable_worker_id(port: int, worker_type: str) -> str:
 
 
 def _read_gpu_info() -> tuple[int, int]:
-    """Best-effort GPU memory read. Returns (used_mb, total_mb).
-
-    Tries pynvml (nvidia-smi python lib). Returns (0, 0) when no GPU or lib
-    unavailable, which tells the gateway there's no GPU to track.
-    """
+    """Best-effort GPU memory read. Returns (used_mb, total_mb)."""
     try:
         import pynvml  # type: ignore
         pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        handle = pynvmlDeviceGetHandleByIndex(0)
+        mem = pynvmlDeviceGetMemoryInfo(handle)
         return (int(mem.used // (1024 * 1024)), int(mem.total // (1024 * 1024)))
     except Exception:
         return (0, 0)
+
+
+def _task_subprocess_entry(gateway: str, worker_id: str, task_id: str, task_type: str,
+                           payload, fn_bytes: bytes, cancel_event):
+    """Runs in a fresh subprocess. Picks up the task function from its module
+    path (fn_bytes) and executes it. Posts result to gateway directly so we
+    don't need a separate Reporter instance in the parent process.
+
+    This function is at module level so multiprocessing.Process can pickle it.
+    """
+    import importlib
+    import json as _json
+    import sys as _sys
+    import traceback as _traceback
+
+    # With "spawn" on Windows/macOS, child inherits an empty default sys.path.
+    # Restore the project root so we can find workers.<type>.tasks.
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _project_root not in _sys.path:
+        _sys.path.insert(0, _project_root)
+
+    info = _json.loads(fn_bytes.decode())
+    mod = importlib.import_module(info["module"])
+    fn = getattr(mod, info["name"])
+
+    def post_result(success: bool, result: dict = None, error: str = ""):
+        url = f"{gateway}/api/workers/{worker_id}/result"
+        try:
+            result_str = _json.dumps(result or {}, ensure_ascii=False)
+        except Exception:
+            result_str = _json.dumps({"raw": str(result)})
+        payload = {"task_id": task_id, "result": result_str, "success": success, "error": error}
+        try:
+            requests.post(url, json=payload, timeout=3)
+        except Exception:
+            pass
+
+    def post_progress(pct: int, log: str = ""):
+        try:
+            requests.post(
+                f"{gateway}/api/workers/{worker_id}/progress",
+                json={"task_id": task_id, "progress": pct, "log": log},
+                timeout=1,
+            )
+        except Exception:
+            pass
+
+    class SubprocessReporter:
+        def progress(self, pct, log=""):
+            post_progress(int(pct), log or "")
+
+    try:
+        result = fn(task_id, payload, SubprocessReporter(), cancel_event) or {}
+        if cancel_event.is_set():
+            post_result(False, error="cancelled")
+        else:
+            post_result(True, result=result)
+    except TaskCancelled as e:
+        post_result(False, error=f"cancelled: {e}")
+    except Exception as e:
+        tb = _traceback.format_exc()
+        print(f"[subprocess {task_id}] exception:\n{tb}", flush=True)
+        try:
+            post_result(False, error=str(e))
+        except Exception:
+            pass
 
 
 class BaseWorker:
@@ -129,10 +180,14 @@ class BaseWorker:
         self.current_task_id: Optional[str] = None
         self.queue_len = 0
         self._lock = threading.Lock()
-        self._reporter: Optional[Reporter] = None
+        self._cancel_event = None  # mp.Event shared with subprocess
+        self._current_proc: Optional[multiprocessing.Process] = None
         self._tasks_completed = 0
-        self._cancel_event: Optional[threading.Event] = None
         self._restart_requested = threading.Event()
+
+        # Use "spawn" so subprocess crashes don't take down the parent (fork
+        # is unsafe with FastAPI's threadlocals).
+        self._mp_ctx = multiprocessing.get_context("spawn")
 
         self._register_routes()
 
@@ -142,7 +197,8 @@ class BaseWorker:
         def health():
             return {"ok": True, "type": self.worker_type, "id": self.worker_id,
                     "queue_len": self.queue_len, "current_task": self.current_task_id,
-                    "tasks_completed": self._tasks_completed}
+                    "tasks_completed": self._tasks_completed,
+                    "pid": self._current_proc.pid if self._current_proc else None}
 
         @self.app.post("/task")
         def handle_task(req: dict):
@@ -172,65 +228,77 @@ class BaseWorker:
 
         @self.app.post("/admin/restart")
         def admin_restart():
-            """Used by operator/test scripts to request a graceful restart."""
             self._restart_requested.set()
             return {"ok": True}
 
     # ---------- Execution ----------
     def _execute(self, task_id: str, task_type: str, payload, fn: Callable):
-        cancel_event = threading.Event()
+        cancel_event = self._mp_ctx.Event()
         with self._lock:
             self.current_task_id = task_id
             self._cancel_event = cancel_event
-        reporter = Reporter(self.gateway, self.worker_id, lambda: self.current_task_id)
-        reporter.start()
 
-        # Schedule watchdog: after DEFAULT_TIMEOUT_DEFAULT seconds, force the
-        # cancel_event so cooperative task functions have a chance to abort.
-        # Tasks must call check_cancel() or cancellable_sleep() to honor this.
-        watchdog = threading.Timer(DEFAULT_TIMEOUT_DEFAULT, cancel_event.set)
+        # Watchdog timer: hard-kill the subprocess after DEFAULT_TIMEOUT_DEFAULT
+        # seconds if the task is still running. Because the subprocess runs in
+        # its own process, terminate() really does kill it (no GIL, no shared
+        # state to corrupt).
+        def fire_watchdog():
+            try:
+                if self._current_proc and self._current_proc.is_alive():
+                    log.warning("watchdog firing: terminating subprocess for task %s (pid %d)",
+                        task_id, self._current_proc.pid)
+                    self._current_proc.terminate()
+                    self._current_proc.join(timeout=3)
+                    if self._current_proc.is_alive():
+                        self._current_proc.kill()
+            except Exception as e:
+                log.error("watchdog error: %s", e)
+
+        watchdog = threading.Timer(DEFAULT_TIMEOUT_DEFAULT, fire_watchdog)
         watchdog.daemon = True
         watchdog.start()
 
-        start_ts = time.time()
+        # Locate the task function by module+name so the subprocess can import
+        # and call it (multiprocessing can't pickle local functions).
+        fn_module = getattr(fn, "__module__", "builtins")
+        fn_name = getattr(fn, "__name__", repr(fn))
+        fn_info = f'{{"module": "{fn_module}", "name": "{fn_name}"}}'.encode()
+
+        proc = self._mp_ctx.Process(
+            target=_task_subprocess_entry,
+            args=(self.gateway, self.worker_id, task_id, task_type, payload, fn_info, cancel_event),
+            daemon=True,
+        )
+        with self._lock:
+            self._current_proc = proc
+        proc.start()
+        log.info("task %s started in subprocess pid=%d", task_id, proc.pid)
+
         try:
-            reporter.progress(1, f"[{task_type}] start")
-            result = fn(task_id, payload, reporter, cancel_event) or {}
-            elapsed = time.time() - start_ts
-            if cancel_event.is_set():
-                if elapsed >= DEFAULT_TIMEOUT_DEFAULT * 0.95:
-                    # watchdog fired and task honored it
-                    log.warning("task %s aborted by watchdog after %.1fs", task_id, elapsed)
-                    reporter.progress(100, f"[{task_type}] cancelled by watchdog")
-                    post_result(self.gateway, self.worker_id, task_id, {},
-                                success=False, error="task timed out (watchdog fired)")
-                else:
-                    # gateway-side cancel arrived
-                    log.info("task %s cancelled by gateway after %.1fs", task_id, elapsed)
-                    reporter.progress(100, f"[{task_type}] cancelled")
-                    post_result(self.gateway, self.worker_id, task_id, {},
-                                success=False, error="cancelled by gateway")
-            else:
-                reporter.progress(100, f"[{task_type}] done")
-                post_result(self.gateway, self.worker_id, task_id, result, success=True)
-        except TaskCancelled as e:
-            log.info("task %s cancelled: %s", task_id, e)
-            reporter.progress(100, f"[{task_type}] cancelled: {e}")
-            post_result(self.gateway, self.worker_id, task_id, {},
-                        success=False, error=f"cancelled: {e}")
-        except Exception as e:
-            log.exception("task %s failed", task_id)
-            reporter.progress(100, f"[{task_type}] failed: {e}")
-            post_result(self.gateway, self.worker_id, task_id, {}, success=False, error=str(e))
+            # Wait for subprocess to finish; timeout slightly longer than the
+            # watchdog so we can read the watchdog's kill if it fired.
+            proc.join(timeout=DEFAULT_TIMEOUT_DEFAULT + 10)
+
+            if proc.is_alive():
+                # watchdog didn't fire yet but we're past our own timeout
+                log.warning("task %s still alive after %ds, force-killing", task_id, DEFAULT_TIMEOUT_DEFAULT + 10)
+                proc.terminate()
+                proc.join(timeout=3)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join()
+                # subprocess may not have posted a result; the gateway will
+                # sweep it via the timeout watchdog.
+            elif proc.exitcode != 0 and proc.exitcode is not None:
+                log.warning("task %s subprocess exitcode=%s", task_id, proc.exitcode)
         finally:
             watchdog.cancel()
-            reporter.stop()
             with self._lock:
                 if self.current_task_id == task_id:
                     self.current_task_id = None
                     self._cancel_event = None
+                    self._current_proc = None
                 self._tasks_completed += 1
-            # self-restart after N tasks to free accumulated Python memory
             if self._tasks_completed >= DEFAULT_RESTART_AFTER_TASKS:
                 log.warning("reached %d tasks, requesting self-restart",
                     self._tasks_completed)
@@ -268,29 +336,28 @@ class BaseWorker:
         def loop():
             interval = DEFAULT_HEARTBEAT_INTERVAL
             while True:
-                    # check for self-restart first
-                    if self._restart_requested.is_set():
-                        log.warning("self-restart triggered, exiting so supervisor can respawn")
-                        os._exit(0)
-                    try:
-                        usage = snapshot_usage()
-                        gpu_used, gpu_total = _read_gpu_info()
-                        body = {
-                            "cpu_usage": usage["cpu_usage"],
-                            "mem_usage": usage["mem_usage"],
-                            "queue_len": self.queue_len,
-                            "gpu_mem_used_mb": gpu_used,
-                            "gpu_mem_total_mb": gpu_total,
-                        }
-                        r = requests.post(
-                            f"{self.gateway}/api/workers/{self.worker_id}/heartbeat",
-                            json=body, timeout=2)
-                        if r.status_code == 404:
-                            log.warning("heartbeat 404, re-registering...")
-                            self.register()
-                    except Exception as e:
-                        log.debug("heartbeat failed: %s", e)
-                    time.sleep(interval)
+                if self._restart_requested.is_set():
+                    log.warning("self-restart triggered, exiting so supervisor can respawn")
+                    os._exit(0)
+                try:
+                    usage = snapshot_usage()
+                    gpu_used, gpu_total = _read_gpu_info()
+                    body = {
+                        "cpu_usage": usage["cpu_usage"],
+                        "mem_usage": usage["mem_usage"],
+                        "queue_len": self.queue_len,
+                        "gpu_mem_used_mb": gpu_used,
+                        "gpu_mem_total_mb": gpu_total,
+                    }
+                    r = requests.post(
+                        f"{self.gateway}/api/workers/{self.worker_id}/heartbeat",
+                        json=body, timeout=2)
+                    if r.status_code == 404:
+                        log.warning("heartbeat 404, re-registering...")
+                        self.register()
+                except Exception as e:
+                    log.debug("heartbeat failed: %s", e)
+                time.sleep(interval)
 
         t = threading.Thread(target=loop, daemon=True)
         t.start()
