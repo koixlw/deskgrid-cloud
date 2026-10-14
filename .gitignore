@@ -3,6 +3,8 @@ bin/gateway.exe~
 build/
 deskgrid-worker.spec
 dist/deskgrid-worker.exe
+gateway/rsrc_*.syso
+gateway/winres/#*.ico
 
 # Python
 __pycache__/
