@@ -202,7 +202,7 @@ func extractPayload(content string, markers []string) string {
 
 func (s *Server) handleChatCompletions(c *gin.Context) {
 	var req ChatRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := bindJSON(c, &req); err != nil {
 		c.JSON(400, gin.H{"error": gin.H{
 			"message": err.Error(),
 			"type":    "invalid_request_error",

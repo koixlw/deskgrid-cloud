@@ -10,9 +10,25 @@ cd /d "%~dp0\.."
 
 echo [build] checking PyInstaller...
 python -c "import PyInstaller" 2>nul || (
-    echo [build] PyInstaller not installed — installing...
+    echo [build] PyInstaller not installed - installing...
     pip install pyinstaller || (
         echo [build] ERROR: pip install pyinstaller failed.
+        exit /b 1
+    )
+)
+
+echo [build] checking worker runtime deps (edge-tts, imageio_ffmpeg)...
+python -c "import edge_tts" 2>nul || (
+    echo [build] edge-tts not installed - installing...
+    pip install edge-tts || (
+        echo [build] ERROR: pip install edge-tts failed.
+        exit /b 1
+    )
+)
+python -c "import imageio_ffmpeg" 2>nul || (
+    echo [build] imageio_ffmpeg not installed - installing...
+    pip install imageio imageio_ffmpeg || (
+        echo [build] ERROR: pip install imageio imageio_ffmpeg failed.
         exit /b 1
     )
 )
@@ -47,6 +63,17 @@ python -m PyInstaller ^
     --hidden-import "fastapi.responses" ^
     --hidden-import "starlette" ^
     --hidden-import "starlette.responses" ^
+    --hidden-import "edge_tts" ^
+    --hidden-import "edge_tts.communicate" ^
+    --hidden-import "edge_tts.drm" ^
+    --hidden-import "edge_tts.exceptions" ^
+    --hidden-import "edge_tts.typing" ^
+    --hidden-import "edge_tts.list_voices" ^
+    --hidden-import "aiohttp" ^
+    --hidden-import "aiohttp.client" ^
+    --hidden-import "websockets" ^
+    --hidden-import "certifi" ^
+    --hidden-import "imageio_ffmpeg" ^
     --hidden-import "uvicorn.logging" ^
     --hidden-import "uvicorn.loops" ^
     --hidden-import "uvicorn.loops.auto" ^

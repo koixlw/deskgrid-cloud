@@ -132,7 +132,7 @@ type registerReq struct {
 
 func (s *Server) registerWorker(c *gin.Context) {
 	var req registerReq
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := bindJSON(c, &req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
@@ -176,7 +176,7 @@ type heartbeatReq struct {
 func (s *Server) heartbeat(c *gin.Context) {
 	id := c.Param("id")
 	var req heartbeatReq
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := bindJSON(c, &req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
@@ -197,7 +197,7 @@ type cancelTaskReq struct {
 func (s *Server) cancelTask(c *gin.Context) {
 	id := c.Param("id")
 	var req cancelTaskReq
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := bindJSON(c, &req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
@@ -219,7 +219,7 @@ type progressReq struct {
 func (s *Server) workerProgress(c *gin.Context) {
 	id := c.Param("id")
 	var req progressReq
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := bindJSON(c, &req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
@@ -246,7 +246,7 @@ type resultReq struct {
 func (s *Server) workerResult(c *gin.Context) {
 	id := c.Param("id")
 	var req resultReq
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := bindJSON(c, &req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
@@ -293,7 +293,7 @@ type peerEvent struct {
 
 func (s *Server) peerReplicate(c *gin.Context) {
 	var ev peerEvent
-	if err := c.ShouldBindJSON(&ev); err != nil {
+	if err := bindJSON(c, &ev); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
@@ -357,7 +357,7 @@ type createTaskReq struct {
 
 func (s *Server) createTask(c *gin.Context) {
 	var req createTaskReq
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := bindJSON(c, &req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
