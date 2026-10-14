@@ -1,5 +1,8 @@
 # Build artifacts (gateway.exe in bin/ is committed for instant run, but rebuilds ignored)
 bin/gateway.exe~
+build/
+deskgrid-worker.spec
+dist/deskgrid-worker.exe
 
 # Python
 __pycache__/

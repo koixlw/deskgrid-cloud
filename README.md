@@ -45,7 +45,11 @@ deskgrid-cloud/
 │   ├── start_worker_code.bat       # 单启 code worker
 │   ├── start_worker_doc.bat        # 单启 doc worker
 │   ├── start_worker_csv.bat        # 单启 csv worker
+│   ├── build_worker_exe.bat        # 把 worker 打成一个 .exe（给同事直接拷贝）
 │   └── stop_all.bat                # 一键停止
+├── worker_launcher.py              # 通用 worker 启动器（被打成 .exe 的入口）
+├── worker.conf.example             # .exe 用的配置模板
+├── dist/                           # 打包后产物：deskgrid-worker.exe + README.txt
 └── logs/                           # 运行时日志
 ```
 
@@ -224,6 +228,30 @@ Gateway → WebSocket 推送给面板
 ## 手机访问
 
 同局域网手机浏览器访问 `http://<电脑IP>:13000/`，面板 CSS 自适应（< 768px 切换单列布局）。
+
+## 受控电脑零依赖部署（单 .exe）
+
+想给同事的电脑装一个 worker，但对方没有 Python？打成一个 exe：
+
+```bat
+scripts\build_worker_exe.bat
+```
+
+产物：`dist\deskgrid-worker.exe`（约 137 MB，PyInstaller --onefile）。
+
+给同事拷两个文件：
+- `deskgrid-worker.exe`
+- `worker.conf.example`（改名 `worker.conf`）
+
+同事在 `worker.conf` 里填：
+```
+TYPE=code
+GATEWAY=http://主控机IP:13000
+GATEWAY_HMAC_SECRET=跟主控机一样
+WORKER_NAME=office-pc-02-code
+```
+
+双击 exe 即可。`--install` 注册成 Windows 计划任务（登录自启 + 失败重试）。详见 `dist\README.txt`。
 
 ## 已知约束
 

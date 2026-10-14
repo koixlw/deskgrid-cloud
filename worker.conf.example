@@ -1,0 +1,24 @@
+# deskgrid-cloud worker config
+# Place this file next to deskgrid-worker.exe and rename to worker.conf.
+# Lines starting with # are comments. CLI args (--type, --gateway, ...)
+# override these values.
+
+# Worker type: code | doc | csv | image | audio | video
+TYPE=code
+
+# Gateway URL (the deskgrid-cloud main node)
+GATEWAY=http://192.168.1.178:13000
+
+# HMAC secret — MUST match the gateway's GATEWAY_HMAC_SECRET
+# Get this from the operator who started the gateway.
+GATEWAY_HMAC_SECRET=change-me-to-match-gateway
+
+# Display name in the dashboard
+WORKER_NAME=office-pc-02-code
+
+# Bind address (0.0.0.0 = reachable from gateway on the LAN)
+WORKER_HOST=0.0.0.0
+
+# Listen port (leave empty to use the default for the type)
+# code=3001, doc=3002, csv=3003, image=3004, audio=3005, video=3006
+PORT=
