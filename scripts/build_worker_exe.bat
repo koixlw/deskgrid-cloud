@@ -24,11 +24,13 @@ if exist dist\deskgrid-worker.pkg del /q dist\deskgrid-worker.pkg
 
 echo [build] running PyInstaller --onefile...
 REM --onefile: bundle everything into a single .exe
+REM --icon: custom multi-resolution .ico
 REM --add-data "workers;workers": include the workers package so imports work
 REM --hidden-import: PyInstaller can't always see dynamic imports, list them
 python -m PyInstaller ^
     --onefile ^
     --name deskgrid-worker ^
+    --icon assets\deskgrid-worker.ico ^
     --add-data "workers;workers" ^
     --hidden-import "workers.code.tasks" ^
     --hidden-import "workers.doc.tasks" ^
