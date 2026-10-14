@@ -26,7 +26,7 @@ worker = BaseWorker(
     name=WORKER_NAME,
     dispatch={
         "audio_tts_line": tts_line,
-        "audio_tts_with_emotion": tts_with_emotion,
+        "audio_tts_emotion": tts_with_emotion,
     },
 )
 

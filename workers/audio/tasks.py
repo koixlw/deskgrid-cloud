@@ -1,67 +1,102 @@
-"""Audio worker tasks - TTS stubs producing real WAV files.
+"""Audio worker tasks - real TTS via edge-tts (Microsoft online, free, no model).
 
-Real production code should replace with:
-    - edge-tts (free, online, high quality)
-    - GPT-SoVITS / CosyVoice (local, high quality)
-    - pyttsx3 (offline, robotic)
+edge-tts calls Microsoft Edge's read-aloud WebSocket API; same voices that
+the Edge browser uses. Works on any machine with internet. Output is MP3.
 
-These implementations generate real WAV files using sine tones whose frequency
-varies per character so the waveform has audible variation. Output works
-end-to-end without any model download.
+Voice catalogue (zh-CN subset):
+    zh-CN-XiaoxiaoNeural   Female   warm, default news-anchor
+    zh-CN-YunxiNeural      Male     lively, podcast-host
+    zh-CN-YunjianNeural    Male     passionate, sports-commentator
+    zh-CN-YunyangNeural    Male     professional, news-anchor
+    zh-CN-XiaoyiNeural     Female   young, cute (cartoon)
+    zh-CN-YunxiaNeural     Male     calm, audiobook
+
+Edge-tts rate/pitch knobs let us fake "emotions" without real emotion
+classification. All runs are async internally; we drive them with asyncio.run
+inside a sync task function so the BaseWorker multiprocessing sandbox still
+works.
 """
-import json
+import asyncio
 import os
 import sys
-import time
-import wave
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.base import cancellable_sleep  # noqa: E402
+from common.base import TaskCancelled  # noqa: E402
 
-import numpy as np
+import edge_tts
 
 OUTPUT_DIR = Path(os.environ.get("AUDIO_OUTPUT_DIR", r"E:\deskgrid-cloud\artifacts"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-SAMPLE_RATE = 22050
+# All voices listed on https://learn.microsoft.com/azure/ai-services/speech-service/
+# language-support — kept as a small selection; users can pass any "ShortName"
+# from edge-tts.list_voices() via payload["voice"].
+DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
+
+# Emotion -> (voice, rate, pitch, volume). Cheap heuristic; real prosody would
+# need an SSML <mstts:express-as> wrapper which edge-tts does not expose.
+EMOTION_PROFILES: dict[str, tuple[str, str, str, str]] = {
+    "neutral": (DEFAULT_VOICE,           "+0%",   "+0Hz",  "+0%"),
+    "calm":    ("zh-CN-YunyangNeural",   "-10%",  "-10Hz", "+0%"),
+    "happy":   ("zh-CN-XiaoyiNeural",    "+10%",  "+5Hz",  "+5%"),
+    "excited": ("zh-CN-YunjianNeural",   "+20%",  "+10Hz", "+10%"),
+    "sad":     ("zh-CN-YunjianNeural",   "-15%",  "-15Hz", "-5%"),
+    "angry":   ("zh-CN-YunjianNeural",   "+15%",  "+5Hz",  "+10%"),
+    "whisper": ("zh-CN-XiaoxiaoNeural",  "-25%",  "-30Hz", "-50%"),
+    "fear":    ("zh-CN-YunxiNeural",     "+20%",  "+15Hz", "-10%"),
+}
 
 
-def _save_wav(path: Path, samples: np.ndarray, sr: int = SAMPLE_RATE):
-    samples = np.clip(samples, -1.0, 1.0)
-    pcm = (samples * 32767).astype(np.int16)
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(sr)
-        w.writeframes(pcm.tobytes())
+async def _synthesize(text: str, voice: str, rate: str, pitch: str, volume: str,
+                      out_path: Path) -> None:
+    """Run one edge-tts synthesis, streaming to disk. Raises on network failure."""
+    communicate = edge_tts.Communicate(
+        text, voice=voice, rate=rate, pitch=pitch, volume=volume,
+    )
+    await communicate.save(str(out_path))
 
 
-def _tone(freq: float, dur: float, sr: int = SAMPLE_RATE, amp: float = 0.25) -> np.ndarray:
-    t = np.linspace(0, dur, int(sr * dur), endpoint=False)
-    return amp * np.sin(2 * np.pi * freq * t)
+def _ensure_synthesizable(text: str, voice: str, rate: str, pitch: str, volume: str) -> tuple:
+    """Work around an edge-tts quirk where very short Chinese text sometimes
+    returns "NoAudioReceived". Pad short inputs with a trailing silence cue.
+
+    Returns (text, voice, rate, pitch, volume) tuple suitable for synthesis."""
+    # If we're applying prosody tweaks AND the input is short Chinese, pad it.
+    if rate == "+0%" and pitch == "+0Hz" and volume == "+0%":
+        return text, voice, rate, pitch, volume
+    has_prosody = rate != "+0%" or pitch != "+0Hz" or volume != "+0%"
+    if not has_prosody:
+        return text, voice, rate, pitch, volume
+    if len(text) >= 12:
+        return text, voice, rate, pitch, volume
+    # Pad with whitespace so the SSML chunk has enough material to render.
+    padded = text + "。" * (12 - len(text))
+    return padded, voice, rate, pitch, volume
 
 
-def _speak(text: str, sr: int = SAMPLE_RATE, base_pitch: float = 180.0) -> np.ndarray:
-    """Render one pitch a sine-based speech envelope per character."""
-    parts = []
-    for ch in text[:200]:
-        if ch.strip():
-            f = base_pitch + (ord(ch) % 12) * 8
-            parts.append(_tone(f, 0.08, sr=sr, amp=0.25))
-        else:
-            parts.append(np.zeros(int(sr * 0.04), dtype=np.float32))
-    if not parts:
-        parts.append(_tone(0, 0.05, sr=sr, amp=0))
-    return np.concatenate(parts).astype(np.float32)
+def _run_async(coro):
+    """asyncio.run helper that supports nested-loop errors cleanly."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        # Already inside an event loop — fall back to a fresh thread + loop.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    return asyncio.run(coro)
 
 
 def _parse_payload(payload):
+    """str (treat as text) or dict (text + voice/rate/pitch/volume)."""
     if isinstance(payload, dict):
         return payload
     if isinstance(payload, str):
         s = payload.strip()
         if s.startswith("{"):
+            import json
             try:
                 return json.loads(s)
             except Exception:
@@ -71,50 +106,80 @@ def _parse_payload(payload):
 
 
 def tts_line(task_id, payload, reporter, cancel_event=None):
-    reporter.progress(10, "[tts] parse")
+    """Synthesize one line of speech. Returns path to a real .mp3 file."""
+    reporter.progress(5, "[tts] parse")
     p = _parse_payload(payload)
-    text = (p.get("text") or "hello world").strip()
+    text = (p.get("text") or "").strip()
     if not text:
-        text = "hello world"
+        raise ValueError("text is required")
 
-    reporter.progress(25, f"[tts] text='{text[:40]}'")
-    cancellable_sleep(0.2, cancel_event)
-    samples = _speak(text)
-    reporter.progress(70, f"[tts] rendered {len(samples)/SAMPLE_RATE:.2f}s audio")
+    voice = p.get("voice") or DEFAULT_VOICE
+    rate = p.get("rate", "+0%")
+    pitch = p.get("pitch", "+0Hz")
+    volume = p.get("volume", "+0%")
 
-    out = OUTPUT_DIR / f"tts_{task_id[:8]}.wav"
-    _save_wav(out, samples)
-    reporter.progress(100, "[tts] done")
+    # Allow short emotion names to short-circuit rate/pitch/volume.
+    emo = (p.get("emotion") or "").lower()
+    if emo and emo in EMOTION_PROFILES:
+        voice, rate, pitch, volume = EMOTION_PROFILES[emo]
+
+    reporter.progress(15, f"[tts] voice={voice} text='{text[:40]}'")
+    out = OUTPUT_DIR / f"tts_{task_id[:8]}.mp3"
+
+    try:
+        _run_async(_synthesize(text, voice, rate, pitch, volume, out))
+    except Exception as e:
+        raise RuntimeError(f"edge-tts synthesis failed: {e}") from e
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise TaskCancelled("tts cancelled before completion")
+
+    if not out.exists() or out.stat().st_size < 200:
+        raise RuntimeError(f"edge-tts produced no output (size={out.stat().st_size if out.exists() else 0})")
+
+    reporter.progress(100, f"[tts] saved {out.stat().st_size:,} bytes")
     return {
         "audio_path": str(out),
-        "duration_s": round(len(samples) / SAMPLE_RATE, 2),
+        "format": "mp3",
+        "voice": voice,
+        "rate": rate,
+        "pitch": pitch,
+        "volume": volume,
         "text": text,
-        "model": "sine-stub-v1",
+        "size_bytes": out.stat().st_size,
+        "engine": "edge-tts",
     }
 
 
 def tts_with_emotion(task_id, payload, reporter, cancel_event=None):
-    reporter.progress(10, "[tts-emo] parse")
+    """Same as tts_line but explicitly takes an 'emotion' key. Maps emotion
+    to a voice + prosody preset."""
+    reporter.progress(5, "[tts-emo] parse")
     p = _parse_payload(payload)
-    text = (p.get("text") or "hello world").strip()
-    emotion = (p.get("emotion") or "neutral").lower()
+    text = (p.get("text") or "").strip() or "你好"
+    emo = (p.get("emotion") or "neutral").lower()
+    if emo not in EMOTION_PROFILES:
+        raise ValueError(f"unknown emotion '{emo}'; pick from {list(EMOTION_PROFILES)}")
 
-    pitch_map = {
-        "happy": 280, "excited": 320, "angry": 200, "sad": 110,
-        "calm": 150, "neutral": 180, "whisper": 90, "fear": 130,
-    }
-    base = pitch_map.get(emotion, 180)
-    reporter.progress(30, f"[tts-emo] emotion={emotion} base_pitch={base}Hz")
-    cancellable_sleep(0.2, cancel_event)
-    samples = _speak(text, base_pitch=base)
+    voice, rate, pitch, volume = EMOTION_PROFILES[emo]
+    reporter.progress(20, f"[tts-emo] emotion={emo} -> {voice} ({rate}, {pitch})")
 
-    out = OUTPUT_DIR / f"tts_emo_{task_id[:8]}.wav"
-    _save_wav(out, samples)
-    reporter.progress(100, "[tts-emo] done")
+    out = OUTPUT_DIR / f"tts_emo_{task_id[:8]}.mp3"
+    try:
+        _run_async(_synthesize(text, voice, rate, pitch, volume, out))
+    except Exception as e:
+        raise RuntimeError(f"edge-tts synthesis failed: {e}") from e
+
+    reporter.progress(100, f"[tts-emo] done ({out.stat().st_size:,} bytes)")
     return {
         "audio_path": str(out),
-        "duration_s": round(len(samples) / SAMPLE_RATE, 2),
+        "format": "mp3",
+        "voice": voice,
+        "rate": rate,
+        "pitch": pitch,
+        "volume": volume,
+        "emotion": emo,
         "text": text,
-        "emotion": emotion,
-        "model": "sine-stub-v1",
+        "size_bytes": out.stat().st_size,
+        "engine": "edge-tts",
     }

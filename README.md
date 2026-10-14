@@ -255,9 +255,28 @@ WORKER_NAME=office-pc-02-code
 
 ## 已知约束
 
-- **中文输入**必须使用 UTF-8 编码。Windows CMD 默认 GBK，请用 PowerShell 或在 Python 中通过 `requests` 库提交。
+- **中文输入**必须使用 UTF-8 编码。Windows CMD / bash 默认 GBK，请用 PowerShell 或 Python `requests` 提交。
 - 内存存储，重启 Gateway 后 Worker 需要重新注册（已自动处理：心跳 404 后自动重注册）。
 - 演示项目未做鉴权，生产环境请加 token / mTLS。
+
+### 中文 payload 必须 UTF-8
+
+中文 / emoji 等非 ASCII 字符必须以 UTF-8 字节到达网关，否则被解析成 `U+FFFD` 替换字符。某些 worker（edge-tts）会因此直接失败。
+
+```bash
+# 正确 - PowerShell 默认 UTF-8
+powershell -Command "
+  \$body = '{\"type\":\"audio_tts_line\",\"payload\":\"{\\\"text\\\":\\\"你好\\\"}\"}'
+  Invoke-RestMethod -Uri 'http://localhost:13000/api/tasks' -Method POST `
+    -ContentType 'application/json; charset=utf-8' -Body \$body
+"
+
+# 正确 - Python requests 自动 UTF-8
+python -c "import requests; r=requests.post('http://localhost:13000/api/tasks', json={'type':'audio_tts_line','payload':'{\"text\":\"你好\"}'})"
+
+# 错误 - bash 直接 curl 中文，GBK 编码后网关替换成 U+FFFD
+curl -X POST http://localhost:13000/api/tasks -d '{"type":"...","payload":"{\"text\":\"你好\"}"}'
+```
 
 ## 性能参考
 
