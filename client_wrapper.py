@@ -182,6 +182,80 @@ def local_usage() -> dict:
     return {"cpu_usage": float(cpu), "mem_usage": float(mem)}
 
 
+# --------------------------------------------------------------------------
+# Per-task-type default templates for the scheduling layer. When the user picks
+# a task type (e.g. --task-type audio_tts_with_emotion) we auto-fill the
+# appropriate capability + resource hint so the gateway can route the task
+# to a worker that actually has edge-tts + enough GPU memory. Any flag the
+# user passes explicitly on the CLI overrides the template.
+#
+# Keys mirror the worker dispatch table in worker_launcher.py:73. New types
+# added there should be added here too.
+# --------------------------------------------------------------------------
+DEFAULT_REQUIREMENTS_BY_TYPE: dict[str, dict] = {
+    # audio
+    "audio_tts_line":         {"require_caps": ["edge-tts"],            "min_gpu_free_mb": 1024},
+    "audio_tts_with_emotion": {"require_caps": ["edge-tts"],            "min_gpu_free_mb": 2048},
+    # video (ffmpeg-heavy)
+    "video_assemble_clip":    {"require_caps": ["ffmpeg"],              "min_gpu_free_mb": 4096},
+    "video_add_subtitle":     {"require_caps": ["ffmpeg", "python"],    "min_gpu_free_mb": 2048},
+    "video_kenburns":         {"require_caps": ["ffmpeg"],              "min_gpu_free_mb": 4096},
+    # image (CPU+RAM + pillow; GPU strongly preferred for SD-class models)
+    "image_txt2img":          {"require_caps": ["pillow"],              "min_gpu_free_mb": 4096},
+    "image_img2img":          {"require_caps": ["pillow"],              "min_gpu_free_mb": 4096},
+    "image_inpaint":          {"require_caps": ["pillow"],              "min_gpu_free_mb": 4096},
+    "image_controlnet":       {"require_caps": ["pillow", "model:controlnet"], "min_gpu_free_mb": 6144},
+    # code / doc / csv — stdlib only, modest resources
+    "code_format":            {"min_cores": 1, "min_memory_mb": 1024},
+    "code_ast":               {"min_cores": 1, "min_memory_mb": 1024},
+    "doc_summary":            {"min_cores": 1, "min_memory_mb": 2048},
+    "doc_wordfreq":           {"min_cores": 1, "min_memory_mb": 1024},
+    "csv_montecarlo":         {"min_cores": 2, "min_memory_mb": 1024},
+    "csv_stats":              {"min_cores": 1, "min_memory_mb": 512},
+    # exec_run: arbitrary command — no defaults; caller decides.
+    "exec_run":               {},
+}
+
+
+def resolve_requirements(args, cfg) -> dict:
+    """Build the ``requirements`` body for /api/tasks from CLI args + per-type
+    template. CLI flags override template defaults; user template can in
+    turn be overridden by setting the same key in ``client.conf``.
+
+    Returns an empty dict when nothing is set (Phase 0 backwards compatible:
+    the gateway treats empty requirements as "no hard filter").
+    """
+    template = DEFAULT_REQUIREMENTS_BY_TYPE.get(args.task_type or "", {})
+
+    caps_raw = _pick(cfg, "CAPS", args.caps, "")
+    require_caps = [c.strip() for c in caps_raw.split(",") if c.strip()] if caps_raw else None
+    if not require_caps and "require_caps" in template:
+        require_caps = list(template["require_caps"])
+
+    min_cores = int(_pick(cfg, "MIN_CORES", str(args.min_cores) if args.min_cores else "", "0") or "0")
+    if not min_cores and "min_cores" in template:
+        min_cores = int(template["min_cores"])
+
+    min_mem = int(_pick(cfg, "MIN_MEM_MB", str(args.min_mem_mb) if args.min_mem_mb else "", "0") or "0")
+    if not min_mem and "min_memory_mb" in template:
+        min_mem = int(template["min_memory_mb"])
+
+    min_gpu = int(_pick(cfg, "MIN_GPU_MB", str(args.min_gpu_mb) if args.min_gpu_mb else "", "0") or "0")
+    if not min_gpu and "min_gpu_free_mb" in template:
+        min_gpu = int(template["min_gpu_free_mb"])
+
+    req: dict = {}
+    if require_caps:
+        req["require_caps"] = require_caps
+    if min_cores:
+        req["min_cores"] = min_cores
+    if min_mem:
+        req["min_memory_mb"] = min_mem
+    if min_gpu:
+        req["min_gpu_free_mb"] = min_gpu
+    return req
+
+
 def gateway_exec_workers_online(gateway: str, token: str, secret: str) -> list:
     """Return list of online exec workers (or [])."""
     try:
@@ -251,6 +325,7 @@ def run_local(cmd: list[str], cwd: Optional[str], env: dict) -> int:
 # --------------------------------------------------------------------------
 def submit_remote(gateway: str, cmd: list[str], cwd: Optional[str], env: dict,
                    timeout: int, priority: int, max_retries: int,
+                   task_type: str, requirements: dict,
                    token: str, secret: str, watch: bool, poll_ms: int,
                    quiet: bool) -> int:
     cmd = _resolve_cmd(cmd)
@@ -263,13 +338,17 @@ def submit_remote(gateway: str, cmd: list[str], cwd: Optional[str], env: dict,
         payload_obj["timeout"] = timeout
 
     body = {
-        "type": "exec_run",
+        "type": task_type or "exec_run",
         "payload": json.dumps(payload_obj, ensure_ascii=False),
         "source": "submit",
         "priority": priority,
         "max_retries": max_retries,
         "timeout_secs": timeout + 10 if timeout else 0,
     }
+    if requirements:
+        body["requirements"] = requirements
+        if not quiet:
+            print(f"[remote] requirements={requirements}", file=sys.stderr)
     if not quiet:
         print(f"[remote] POST {gateway.rstrip('/')}/api/tasks  type=exec_run", file=sys.stderr)
     try:
@@ -358,6 +437,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--priority", type=int, default=0)
     p.add_argument("--max-retries", type=int, default=0)
     p.add_argument("--mode", choices=["auto", "local", "remote"], default="auto")
+    # Phase 1: scheduling hints — resource requirements + task type.
+    p.add_argument("--task-type", default="exec_run",
+                   help="task type (e.g. exec_run, audio_tts_with_emotion, image_txt2img). "
+                        "Picks a default requirements template if you don't set --caps / --min-*.")
+    p.add_argument("--caps", default=None,
+                   help="comma-separated capability tags the worker must have "
+                        "(e.g. 'ffmpeg,python' or 'model:sdxl'). Overrides template.")
+    p.add_argument("--min-cores", type=int, default=None,
+                   help="minimum CPU cores the worker must have")
+    p.add_argument("--min-mem-mb", type=int, default=None,
+                   help="minimum total memory (MB) the worker must have")
+    p.add_argument("--min-gpu-mb", type=int, default=None,
+                   help="minimum free GPU memory (MB); workers without a GPU are filtered out")
     p.add_argument("--cpu-threshold", type=float, default=None)
     p.add_argument("--mem-threshold", type=float, default=None)
     p.add_argument("--local-fallback", default=None,
@@ -395,10 +487,12 @@ def main() -> int:
     gateway = _pick(cfg, "GATEWAY", args.gateway, "http://127.0.0.1:13000")
     token = _pick(cfg, "GATEWAY_TOKEN", args.token, "")
     secret = _pick(cfg, "GATEWAY_HMAC_SECRET", args.hmac_secret, "")
+    requirements = resolve_requirements(args, cfg)
     return submit_remote(
         gateway=gateway, cmd=args.cmd, cwd=args.cwd, env=env,
         timeout=args.timeout, priority=args.priority,
         max_retries=args.max_retries,
+        task_type=args.task_type, requirements=requirements,
         token=token, secret=secret,
         watch=args.watch, poll_ms=args.poll_ms, quiet=args.quiet,
     )

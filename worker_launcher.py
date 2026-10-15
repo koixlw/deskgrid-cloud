@@ -163,6 +163,12 @@ def resolve_config(args: argparse.Namespace) -> dict:
         port_str = str(DEFAULT_PORT_BY_TYPE[wtype])
     port = int(port_str) if port_str else 0
 
+    # Capability-related knobs — sourced from worker.conf OR env. Returned in
+    # cfg so run_worker() can propagate them to os.environ (capabilities.py
+    # reads them at register time).
+    capabilities = pick("WORKER_CAPABILITIES", None)
+    model_dirs = pick("WORKER_MODEL_DIRS", None)
+
     return {
         "type": wtype,
         "gateway": gateway,
@@ -170,6 +176,8 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "name": name,
         "host": host,
         "port": port,
+        "capabilities": capabilities,
+        "model_dirs": model_dirs,
     }
 
 
@@ -296,6 +304,12 @@ def run_worker(cfg: dict) -> int:
     os.environ["PORT"] = str(cfg["port"])
     os.environ["GATEWAY"] = cfg["gateway"]
     os.environ["WORKER_NAME"] = cfg["name"]
+    # Capability knobs (from worker.conf or real env) — propagated so
+    # common.capabilities.collect() reads them at register time.
+    if cfg.get("capabilities"):
+        os.environ["WORKER_CAPABILITIES"] = cfg["capabilities"]
+    if cfg.get("model_dirs"):
+        os.environ["WORKER_MODEL_DIRS"] = cfg["model_dirs"]
 
     import uvicorn  # imported late so --install doesn't need it
 

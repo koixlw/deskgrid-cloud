@@ -2,6 +2,7 @@
 const state = {
   workers: new Map(),
   tasks: new Map(),
+  stats: { completed: 0, failed: 0 }, // lifetime counters from gateway; survives task cleanup / eviction
   expanded: new Set(), // task IDs that are expanded
   filter: 'all',
   ws: null,
@@ -135,6 +136,7 @@ function handleEvent(msg) {
       state.tasks.clear();
       (payload.workers || []).forEach((w) => state.workers.set(w.id, w));
       (payload.tasks || []).forEach((t) => state.tasks.set(t.id, t));
+      if (payload.stats) state.stats = { ...state.stats, ...payload.stats };
       render();
       break;
     case 'worker_added':
@@ -168,6 +170,18 @@ function handleEvent(msg) {
       renderTasks();
       renderKPIs();
       break;
+    case 'task_deleted':
+      state.tasks.delete(payload.id);
+      state.expanded.delete(payload.id);
+      renderTasks();
+      renderKPIs();
+      break;
+    case 'stats_updated':
+      // Gateway pushes this whenever a task transitions to done/failed.
+      // Lifetime counters — task_done/task_deleted events don't move them.
+      state.stats = { ...state.stats, ...payload };
+      renderKPIs();
+      break;
   }
 }
 
@@ -183,12 +197,12 @@ function renderKPIs() {
   const tasks = Array.from(state.tasks.values());
   const online = workers.filter((w) => w.status !== 'offline').length;
   const running = tasks.filter((t) => t.status === 'running').length;
-  const done = tasks.filter((t) => t.status === 'done').length;
-  const failed = tasks.filter((t) => t.status === 'failed').length;
+  // 累计完成 / 失败任务 come from gateway-side lifetime counters, not the
+  // current in-memory task list: a deleted or evicted task still counts.
   $('#kpi-workers').textContent = online;
   $('#kpi-running').textContent = running;
-  $('#kpi-done').textContent = done;
-  $('#kpi-failed').textContent = failed;
+  $('#kpi-done').textContent = state.stats.completed || 0;
+  $('#kpi-failed').textContent = state.stats.failed || 0;
 }
 
 function renderWorkers() {
@@ -317,6 +331,58 @@ function renderTasks() {
       if (open) state.expanded.add(t.id);
       else state.expanded.delete(t.id);
     });
+
+    // Cancel button: only enabled while pending/running, posts to
+    // gateway which forwards to the worker via pushCancelToWorker.
+    const cancelBtn = node.querySelector('.task-cancel');
+    const canCancel = t.status === 'pending' || t.status === 'running';
+    cancelBtn.disabled = !canCancel;
+    if (!canCancel) cancelBtn.title = '任务已结束，无需中断';
+    cancelBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (!t.worker_id) { alert('该任务尚未派发给 worker'); return; }
+      if (!confirm(`确认中断任务 ${t.id.slice(0, 8)} ？`)) return;
+      cancelBtn.disabled = true;
+      try {
+        const r = await authedFetch(`/api/workers/${t.worker_id}/task/cancel`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task_id: t.id }),
+        });
+        if (!r.ok) {
+          const msg = await r.text().catch(() => '');
+          alert(`中断失败 (${r.status}): ${msg || r.statusText}`);
+          cancelBtn.disabled = false;
+        }
+      } catch (e) {
+        alert(`中断失败: ${e}`);
+        cancelBtn.disabled = false;
+      }
+    });
+
+    // Delete button: removes the task from gateway store. If the task
+    // is still running, the gateway also pushes a cancel to the worker.
+    const deleteBtn = node.querySelector('.task-delete');
+    deleteBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      const verb = canCancel ? '中断并删除' : '删除';
+      if (!confirm(`确认${verb}任务 ${t.id.slice(0, 8)} ？此操作不可恢复。`)) return;
+      deleteBtn.disabled = true;
+      try {
+        const r = await authedFetch(`/api/tasks/${t.id}`, { method: 'DELETE' });
+        if (!r.ok) {
+          const msg = await r.text().catch(() => '');
+          alert(`删除失败 (${r.status}): ${msg || r.statusText}`);
+          deleteBtn.disabled = false;
+        }
+        // On success, the gateway emits task_deleted over WebSocket
+        // and the item drops out of the list via handleEvent().
+      } catch (e) {
+        alert(`删除失败: ${e}`);
+        deleteBtn.disabled = false;
+      }
+    });
+
     list.appendChild(node);
   });
 }
@@ -384,6 +450,49 @@ function renderMediaFromResult(parsed) {
   }
   return added ? wrap : null;
 }
+// Per-type scheduling hints (capabilities + min resources). Mirrors
+// `DEFAULT_REQUIREMENTS_BY_TYPE` in client_wrapper.py — keeping the two in
+// lockstep is a Phase 1 invariant: if you add a new task type, add it here
+// and there.
+const REQUIREMENTS_BY_TYPE = {
+  code_format:            { require_caps: [],                  min_cores: 1,  min_memory_mb: 1024 },
+  code_ast:               { require_caps: [],                  min_cores: 1,  min_memory_mb: 1024 },
+  doc_summary:            { require_caps: [],                  min_cores: 1,  min_memory_mb: 2048 },
+  doc_wordfreq:           { require_caps: [],                  min_cores: 1,  min_memory_mb: 1024 },
+  csv_montecarlo:         { require_caps: [],                  min_cores: 2,  min_memory_mb: 1024 },
+  csv_stats:              { require_caps: [],                  min_cores: 1,  min_memory_mb: 512  },
+  image_txt2img:          { require_caps: ['pillow'],          min_gpu_free_mb: 4096 },
+  image_img2img:          { require_caps: ['pillow'],          min_gpu_free_mb: 4096 },
+  image_inpaint:          { require_caps: ['pillow'],          min_gpu_free_mb: 4096 },
+  image_controlnet:       { require_caps: ['pillow','model:controlnet'], min_gpu_free_mb: 6144 },
+  audio_tts_line:         { require_caps: ['edge-tts'],        min_gpu_free_mb: 1024 },
+  audio_tts_with_emotion: { require_caps: ['edge-tts'],        min_gpu_free_mb: 2048 },
+  video_assemble_clip:    { require_caps: ['ffmpeg'],          min_gpu_free_mb: 4096 },
+  video_add_subtitle:     { require_caps: ['ffmpeg','python'], min_gpu_free_mb: 2048 },
+  video_kenburns:         { require_caps: ['ffmpeg'],          min_gpu_free_mb: 4096 },
+};
+
+function readRequirementsFromForm() {
+  // Returns {} when all 4 fields are empty (= backwards-compatible: no hard filter).
+  const caps = ($('#req-caps')?.value || '').trim();
+  const cores = parseInt($('#req-cores')?.value || '', 10);
+  const mem = parseInt($('#req-mem')?.value || '', 10);
+  const gpu = parseInt($('#req-gpu')?.value || '', 10);
+  const req = {};
+  if (caps) req.require_caps = caps.split(',').map((s) => s.trim()).filter(Boolean);
+  if (Number.isFinite(cores) && cores > 0) req.min_cores = cores;
+  if (Number.isFinite(mem)   && mem   > 0) req.min_memory_mb = mem;
+  if (Number.isFinite(gpu)   && gpu   > 0) req.min_gpu_free_mb = gpu;
+  return req;
+}
+
+function applyRequirementsToForm(req) {
+  $('#req-caps').value  = (req.require_caps    || []).join(', ');
+  $('#req-cores').value = (req.min_cores       && req.min_cores       > 0) ? req.min_cores : '';
+  $('#req-mem').value   = (req.min_memory_mb   && req.min_memory_mb   > 0) ? req.min_memory_mb : '';
+  $('#req-gpu').value   = (req.min_gpu_free_mb && req.min_gpu_free_mb > 0) ? req.min_gpu_free_mb : '';
+}
+
 $('#task-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const type = $('#task-type').value;
@@ -392,14 +501,17 @@ $('#task-form').addEventListener('submit', async (e) => {
     alert('请填写 payload');
     return;
   }
+  const requirements = readRequirementsFromForm();
   const btn = e.target.querySelector('.btn-primary');
   btn.disabled = true;
   btn.textContent = '下发中...';
   try {
+    const body = { type, payload, source: 'panel' };
+    if (Object.keys(requirements).length > 0) body.requirements = requirements;
     const r = await authedFetch('/api/tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type, payload, source: 'panel' }),
+      body: JSON.stringify(body),
     });
     if (!r.ok) {
       const err = await r.json();
@@ -438,6 +550,15 @@ $('#load-template').addEventListener('click', () => {
     video_kenburns: '{"prompt": "ancient castle on a hill", "fps": 12, "duration": 3}',
   };
   $('#task-payload').value = templates[type] || '';
+  // Mirror the per-type template into the advanced fields so the operator
+  // sees the defaults and can tweak before submitting.
+  applyRequirementsToForm(REQUIREMENTS_BY_TYPE[type] || {});
+});
+
+// When the user manually changes the task type, only update payload; the
+// advanced requirements block stays as-is so a manual override isn't clobbered.
+$('#task-type').addEventListener('change', () => {
+  // intentionally empty — payload loads via the explicit "载入模板" button.
 });
 
 $$('.filter').forEach((btn) => {
@@ -453,14 +574,16 @@ $$('.filter').forEach((btn) => {
 setInterval(async () => {
   if (!state.ws || state.ws.readyState !== 1) {
     try {
-      const [wr, tr] = await Promise.all([
+      const [wr, tr, st] = await Promise.all([
         authedFetch('/api/workers').then((r) => r.json()),
         authedFetch('/api/tasks').then((r) => r.json()),
+        authedFetch('/api/stats').then((r) => r.json()),
       ]);
       state.workers.clear();
       state.tasks.clear();
       wr.forEach((w) => state.workers.set(w.id, w));
       tr.forEach((t) => state.tasks.set(t.id, t));
+      if (st && typeof st.completed === 'number') state.stats = { ...state.stats, ...st };
       render();
     } catch (e) { /* ignore */ }
   }

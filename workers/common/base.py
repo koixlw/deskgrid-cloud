@@ -34,6 +34,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .hardware import collect as collect_hw, snapshot_usage
+from .capabilities import collect as collect_caps
 
 log = logging.getLogger("worker")
 
@@ -444,6 +445,7 @@ class BaseWorker:
     # ---------- Gateway lifecycle ----------
     def register(self):
         hw = collect_hw()
+        caps = collect_caps(self.worker_type)
         body = {
             "id": self.worker_id,
             "type": self.worker_type,
@@ -452,6 +454,7 @@ class BaseWorker:
             "cores": hw["cores"],
             "memory_mb": hw["memory_mb"],
             "port": self.port,
+            "capabilities": caps,
         }
         last_err = None
         for attempt in range(10):

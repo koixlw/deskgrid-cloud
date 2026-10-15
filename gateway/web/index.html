@@ -110,6 +110,26 @@
         <button type="button" class="btn-secondary" id="load-template">载入模板</button>
       </div>
       <div class="form-hint">网关会根据 CPU/内存/队列长度评分，自动选择最合适的节点</div>
+      <details class="form-advanced" id="task-advanced">
+        <summary>高级 · 资源需求（可选）</summary>
+        <div class="form-row form-row-advanced">
+          <label>必须能力</label>
+          <input type="text" id="req-caps" name="require_caps" placeholder="ffmpeg,python,model:sdxl">
+        </div>
+        <div class="form-row form-row-advanced">
+          <label>最少 CPU 核数</label>
+          <input type="number" id="req-cores" name="min_cores" min="0" step="1" placeholder="不限">
+        </div>
+        <div class="form-row form-row-advanced">
+          <label>最少内存 (MB)</label>
+          <input type="number" id="req-mem" name="min_memory_mb" min="0" step="64" placeholder="不限">
+        </div>
+        <div class="form-row form-row-advanced">
+          <label>最少可用显存 (MB)</label>
+          <input type="number" id="req-gpu" name="min_gpu_free_mb" min="0" step="64" placeholder="不限">
+        </div>
+        <div class="form-advanced-hint">切换任务类型 + 点"载入模板"会自动填充合理默认值，不填 = 不做约束（向后兼容）</div>
+      </details>
     </form>
   </section>
 </main>
@@ -146,6 +166,8 @@
       <span class="task-type"></span>
       <span class="task-status">pending</span>
       <span class="task-time"></span>
+      <button type="button" class="task-cancel" title="中断任务（仅在 running 时可用）">⏹ 中断</button>
+      <button type="button" class="task-delete" title="从列表删除任务">✕ 删除</button>
       <span class="task-toggle">▾</span>
     </div>
     <div class="task-progress-wrap">

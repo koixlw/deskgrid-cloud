@@ -25,8 +25,59 @@ func indexByte(s string, c byte) int {
 	return -1
 }
 
+// contains is a tiny string-slice membership check; avoids pulling in
+// slices.Contains for a 6-line hot path.
+func contains(haystack []string, needle string) bool {
+	for _, x := range haystack {
+		if x == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// WorkerMeetsRequirements returns true if w satisfies all the hard
+// constraints in req. Zero / empty fields in req are treated as "no limit", so
+// this is a no-op for tasks submitted without a requirements struct
+// (backwards compatible with Phase 0 clients).
+//
+// Constraint    | Worker must satisfy
+//---------------|------------------------------------------
+// RequireCaps   | has every listed cap in W.Capabilities
+// MinCores      | W.Cores >= MinCores (only checked if > 0)
+// MinMemoryMB   | W.MemoryMB >= MinMemoryMB (only checked if > 0)
+// MinGPUFreeMB  | W.GPUMemTotalMB > 0 AND (Total - Used) >= MinGPUFreeMB
+//               | (workers without a GPU cannot satisfy a non-zero min)
+func WorkerMeetsRequirements(w *Worker, req TaskRequirements) bool {
+	if w == nil {
+		return false
+	}
+	for _, c := range req.RequireCaps {
+		if !contains(w.Capabilities, c) {
+			return false
+		}
+	}
+	if req.MinCores > 0 && w.Cores < req.MinCores {
+		return false
+	}
+	if req.MinMemoryMB > 0 && w.MemoryMB < req.MinMemoryMB {
+		return false
+	}
+	if req.MinGPUFreeMB > 0 {
+		if w.GPUMemTotalMB <= 0 {
+			return false
+		}
+		free := w.GPUMemTotalMB - w.GPUMemUsedMB
+		if free < req.MinGPUFreeMB {
+			return false
+		}
+	}
+	return true
+}
+
 // ScoreWorker scores a worker for suitability to run a task of type t.
-// Higher score = better candidate. Returns -1 if worker is not eligible.
+// Higher score = better candidate. Returns -1 if worker is not eligible
+// (wrong type, offline, or fails WorkerMeetsRequirements).
 //
 // Formula:
 //
@@ -41,11 +92,14 @@ func indexByte(s string, c byte) int {
 //	      + 0.10 * gpuFree
 //	      + 0.15 * queueScore
 //	      + 0.10 * (stability * 100)
-func ScoreWorker(w *Worker, taskType string) float64 {
+func ScoreWorker(w *Worker, taskType string, req TaskRequirements) float64 {
 	if !workerMatchesType(w, taskType) {
 		return -1
 	}
 	if w.Status == "offline" {
+		return -1
+	}
+	if !WorkerMeetsRequirements(w, req) {
 		return -1
 	}
 
@@ -83,10 +137,10 @@ func ScoreWorker(w *Worker, taskType string) float64 {
 		0.10*stability*100
 }
 
-// PickWorker selects the best worker for the given task type. Optionally
-// excludes a worker ID (used during re-dispatch on retry to avoid sending the
-// same failing task back to the same node).
-func (s *Store) PickWorker(taskType string, excludeWorkerID ...string) *Worker {
+// PickWorker selects the best worker for the given task type and hard
+// requirements. Optionally excludes a worker ID (used during re-dispatch on
+// retry to avoid sending the same failing task back to the same node).
+func (s *Store) PickWorker(taskType string, req TaskRequirements, excludeWorkerID ...string) *Worker {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	excluded := make(map[string]bool, len(excludeWorkerID))
@@ -99,7 +153,7 @@ func (s *Store) PickWorker(taskType string, excludeWorkerID ...string) *Worker {
 		if excluded[w.ID] {
 			continue
 		}
-		score := ScoreWorker(w, taskType)
+		score := ScoreWorker(w, taskType, req)
 		if score > bestScore {
 			bestScore = score
 			cp := *w

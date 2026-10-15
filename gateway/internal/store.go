@@ -7,47 +7,68 @@ import (
 
 // Worker represents a compute node registered with the gateway.
 type Worker struct {
-	ID           string    `json:"id"`
-	Type         string    `json:"type"` // code | doc | csv | image | audio | video
-	Name         string    `json:"name"`
-	CPU          string    `json:"cpu"`
-	Cores        int       `json:"cores"`
-	MemoryMB     int       `json:"memory_mb"`
-	CPUUsage     float64   `json:"cpu_usage"`
-	MemUsage     float64   `json:"mem_usage"`
-	QueueLen     int       `json:"queue_len"`
-	Status       string    `json:"status"` // online | busy | offline
-	LastSeen     time.Time `json:"last_seen"`
-	TasksDone    int       `json:"tasks_done"`
-	TasksFailed  int       `json:"tasks_failed"` // running count
-	Stability    float64   `json:"stability"`    // 1.0 = no failures, 0.5 = half failed
-	GPUMemUsedMB int64     `json:"gpu_mem_used_mb"`
-	GPUMemTotalMB int64    `json:"gpu_mem_total_mb"`
-	Host         string    `json:"host"`
-	Port         int       `json:"port"`
-	RegisteredAt time.Time `json:"registered_at"`
+	ID            string    `json:"id"`
+	Type          string    `json:"type"` // code | doc | csv | image | audio | video | exec
+	Name          string    `json:"name"`
+	CPU           string    `json:"cpu"`
+	Cores         int       `json:"cores"`
+	MemoryMB      int       `json:"memory_mb"`
+	CPUUsage      float64   `json:"cpu_usage"`
+	MemUsage      float64   `json:"mem_usage"`
+	QueueLen      int       `json:"queue_len"`
+	Status        string    `json:"status"` // online | busy | offline
+	LastSeen      time.Time `json:"last_seen"`
+	TasksDone     int       `json:"tasks_done"`
+	TasksFailed   int       `json:"tasks_failed"` // running count
+	Stability     float64   `json:"stability"`    // 1.0 = no failures, 0.5 = half failed
+	GPUMemUsedMB  int64     `json:"gpu_mem_used_mb"`
+	GPUMemTotalMB int64     `json:"gpu_mem_total_mb"`
+	Host          string    `json:"host"`
+	Port          int       `json:"port"`
+	Capabilities  []string  `json:"capabilities,omitempty"` // self-reported: ["python","ffmpeg","model:sdxl",...]
+	RegisteredAt  time.Time `json:"registered_at"`
+}
+
+// TaskRequirements describes the hard constraints a task imposes on a worker.
+// Empty / zero values are treated as "no constraint" so old clients can submit
+// tasks without this struct and fall through to scoring-only selection.
+type TaskRequirements struct {
+	RequireCaps  []string `json:"require_caps,omitempty"`
+	MinCores     int      `json:"min_cores,omitempty"`
+	MinMemoryMB  int      `json:"min_memory_mb,omitempty"`
+	MinGPUFreeMB int64    `json:"min_gpu_free_mb,omitempty"`
 }
 
 // Task represents a unit of work dispatched to a worker.
 type Task struct {
-	ID          string        `json:"id"`
-	Type        string        `json:"type"`
-	Payload     string        `json:"payload"`
-	WorkerID    string        `json:"worker_id"`
-	Status      string        `json:"status"` // pending | running | done | failed
-	Progress    int           `json:"progress"`
-	Priority    int           `json:"priority"`    // higher = more important
-	MaxRetries  int           `json:"max_retries"` // 0 = no retry
-	Retries     int           `json:"retries"`     // current retry count
-	TimeoutSecs int           `json:"timeout_secs"` // per-task timeout; 0 = use default
-	CreatedAt    time.Time     `json:"created_at"`
-	StartedAt   time.Time     `json:"started_at,omitempty"`
-	FinishedAt  time.Time     `json:"finished_at,omitempty"`
-	Result      string        `json:"result,omitempty"`
-	Error       string        `json:"error,omitempty"`
-	Logs        []string      `json:"logs"`
-	Source      string        `json:"source"` // panel | openai
-	cancelCh    chan struct{} `json:"-"` // internal: signaled to request task abort
+	ID           string           `json:"id"`
+	Type         string           `json:"type"`
+	Payload      string           `json:"payload"`
+	WorkerID     string           `json:"worker_id"`
+	Status       string           `json:"status"` // pending | running | done | failed
+	Progress     int              `json:"progress"`
+	Priority     int              `json:"priority"`    // higher = more important
+	MaxRetries   int              `json:"max_retries"` // 0 = no retry
+	Retries      int              `json:"retries"`     // current retry count
+	TimeoutSecs  int              `json:"timeout_secs"` // per-task timeout; 0 = use default
+	CreatedAt    time.Time        `json:"created_at"`
+	StartedAt    time.Time        `json:"started_at,omitempty"`
+	FinishedAt   time.Time        `json:"finished_at,omitempty"`
+	Result       string           `json:"result,omitempty"`
+	Error        string           `json:"error,omitempty"`
+	Logs         []string         `json:"logs"`
+	Source       string           `json:"source"` // panel | openai
+	Requirements TaskRequirements `json:"requirements,omitempty"` // hard filters; empty = no filter
+	cancelCh     chan struct{}    `json:"-"` // internal: signaled to request task abort
+}
+
+// Stats is the lifetime aggregate of task outcomes. Survives across the
+// in-memory task map (cleanup evicts old tasks after taskTTL; Stats does
+// not forget them). Persisted to gateway-state/stats.json so the values
+// carry across gateway restarts.
+type Stats struct {
+	Completed int `json:"completed"`
+	Failed    int `json:"failed"`
 }
 
 // Store is an in-memory store for workers, tasks, and event history.
@@ -55,6 +76,7 @@ type Store struct {
 	mu      sync.RWMutex
 	workers map[string]*Worker
 	tasks   map[string]*Task
+	stats   Stats
 	// notify is the broadcast channel used by ws Hub
 	notify func(event string, payload interface{})
 }
@@ -64,6 +86,22 @@ func NewStore() *Store {
 		workers: make(map[string]*Worker),
 		tasks:   make(map[string]*Task),
 	}
+}
+
+// StatsSnapshot returns a copy of the lifetime counters. Cheap (struct copy).
+func (s *Store) StatsSnapshot() Stats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.stats
+}
+
+// SetStats overwrites the lifetime counters. Called once at startup from the
+// persistence layer; do not use at runtime (the increments are not
+// idempotent — re-applying after a partial run would double-count).
+func (s *Store) SetStats(st Stats) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stats = st
 }
 
 func (s *Store) SetNotifier(fn func(event string, payload interface{})) {
@@ -81,6 +119,7 @@ func (s *Store) AddWorker(w *Worker) {
 		existing.Name = w.Name
 		existing.Host = w.Host
 		existing.Port = w.Port
+		existing.Capabilities = w.Capabilities
 		existing.LastSeen = time.Now()
 		existing.Status = "online"
 		// reset stability on re-register
@@ -284,20 +323,25 @@ func (s *Store) FinishTask(taskID, result, errMsg string, success bool) {
 	if success {
 		t.Status = "done"
 		t.Result = result
+		s.stats.Completed++
+		// Only successful completions bump the worker's tally. Stability is
+		// updated separately via RecordTaskResult from the caller (so a
+		// failure can both fail-stability and report here as a failure).
+		if t.WorkerID != "" {
+			if w, ok := s.workers[t.WorkerID]; ok {
+				w.TasksDone++
+			}
+		}
 	} else {
 		t.Status = "failed"
 		t.Error = errMsg
-	}
-	if t.WorkerID != "" {
-		if w, ok := s.workers[t.WorkerID]; ok {
-			w.TasksDone++
-			// stability updated separately via RecordTaskResult from caller
-		}
+		s.stats.Failed++
 	}
 	tCopy := *t
 	tCopy.Logs = append([]string{}, t.Logs...)
 	s.mu.Unlock()
 	s.notify("task_done", &tCopy)
+	s.notify("stats_updated", s.StatsSnapshot())
 }
 
 // SweepTimeouts marks running tasks whose StartedAt + TimeoutSecs < now as failed.
@@ -306,6 +350,22 @@ func (s *Store) FinishTask(taskID, result, errMsg string, success bool) {
 // Returns the list of tasks that were just timed out AND have retries left, so
 // the caller can re-dispatch them. Tasks that already exhausted retries are
 // simply marked failed.
+func (s *Store) RemoveTask(id string) *Task {
+	s.mu.Lock()
+	t, ok := s.tasks[id]
+	if !ok {
+		s.mu.Unlock()
+		return nil
+	}
+	delete(s.tasks, id)
+	cp := *t
+	logsCopy := append([]string{}, t.Logs...)
+	cp.Logs = logsCopy
+	s.mu.Unlock()
+	s.notify("task_deleted", &cp)
+	return &cp
+}
+
 func (s *Store) SweepTimeouts(defaultTimeout time.Duration) (retriable []*Task) {
 	s.mu.RLock()
 	candidates := make([]*Task, 0)
@@ -335,7 +395,9 @@ func (s *Store) SweepTimeouts(defaultTimeout time.Duration) (retriable []*Task) 
 	return retriable
 }
 
-// TimeoutTask is like FailTaskDirect but tagged with a timeout reason.
+// TimeoutTask is like FailTaskDirect but tagged with a timeout reason, and
+// unlike FailTaskDirect it DOES count as a real failure (worker ran past its
+// allotted time → that is a task outcome).
 func (s *Store) TimeoutTask(taskID, reason string) {
 	s.mu.Lock()
 	t, ok := s.tasks[taskID]
@@ -350,8 +412,10 @@ func (s *Store) TimeoutTask(taskID, reason string) {
 	tCopy := *t
 	tCopy.Logs = append([]string{}, t.Logs...)
 	wID := t.WorkerID
+	s.stats.Failed++
 	s.mu.Unlock()
 	s.notify("task_done", &tCopy)
+	s.notify("stats_updated", s.StatsSnapshot())
 	if wID != "" {
 		s.RecordTaskResult(wID, false)
 	}
@@ -425,9 +489,18 @@ func (s *Store) ListTasks() []*Task {
 	return out
 }
 
-// FailTaskDirect marks a task as failed without bumping worker.TasksDone.
-// Used at gateway restart to settle in-flight tasks whose workers may not
-// still be alive.
+// FailTaskDirect marks a task as failed WITHOUT recording Stats and WITHOUT
+// touching worker.TasksDone. Two reasons this is intentionally silent:
+//
+//   - Used at gateway restart to settle in-flight tasks whose original
+//     worker is unlikely to still be alive. These tasks were already
+//     counted in the prior session's persisted Stats — re-counting them
+//     here would double-count.
+//   - Runtime failures go through FinishTask(false) or TimeoutTask, both
+//     of which DO bump Stats.Failed and emit stats_updated.
+//
+// Do NOT call this at runtime as a shortcut to "fail a task" — use
+// FinishTask(false) instead.
 func (s *Store) FailTaskDirect(taskID, errMsg string) {
 	s.mu.Lock()
 	t, ok := s.tasks[taskID]

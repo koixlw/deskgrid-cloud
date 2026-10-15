@@ -22,3 +22,19 @@ WORKER_HOST=0.0.0.0
 # Listen port (leave empty to use the default for the type)
 # code=3001, doc=3002, csv=3003, image=3004, audio=3005, video=3006
 PORT=
+
+# ---- Capability auto-detection (Phase 1) -----------------------------
+# WORKER_MODEL_DIRS is a semicolon-separated list of directories to scan for
+# model weights. Each *direct* child becomes a `model:<name>` capability that
+# the gateway uses to hard-filter tasks requiring a specific model.
+#   - subdirectories  → emit `model:<dirname>`
+#   - *.safetensors / *.ckpt / *.pt / *.pth / *.bin / *.onnx / *.gguf → emit `model:<basename>`
+# Example:
+#   WORKER_MODEL_DIRS=E:\models\sdxl\weights;E:\models\controlnet\weights
+
+# WORKER_CAPABILITIES is a comma-separated list of extra tags to advertise
+# in addition to whatever the auto-detector finds. Use it to manually claim
+# `model:<x>` for weights the scanner can't see, or to drop a capability
+# the operator knows is broken.
+# Example:
+#   WORKER_CAPABILITIES=model:sdxl,model:controlnet

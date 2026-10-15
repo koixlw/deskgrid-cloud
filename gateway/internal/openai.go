@@ -240,7 +240,7 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 	}
 
 	// dispatch and wait for completion (synchronous — TRAE expects a result in the response)
-	worker := s.store.PickWorker(taskType)
+	worker := s.store.PickWorker(taskType, TaskRequirements{})
 	if worker == nil {
 		c.JSON(503, gin.H{"error": gin.H{
 			"message": fmt.Sprintf("no worker available for task type '%s'", taskType),

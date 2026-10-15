@@ -89,6 +89,7 @@ func (s *Server) routes() {
 		api.GET("/auth-check", s.authCheck)
 		api.GET("/workers", s.listWorkers)
 		api.GET("/workers/:id", s.getWorker)
+		api.GET("/stats", s.getStats)
 		// Worker-originated endpoints: require HMAC signature (in addition to Bearer)
 		hmac := HMACMiddleware(s.hmacSecret)
 		api.POST("/workers/register", hmac, bodyLimit(16*1024), s.registerWorker)
@@ -100,6 +101,7 @@ func (s *Server) routes() {
 
 		api.GET("/tasks", s.listTasks)
 		api.GET("/tasks/:id", s.getTask)
+		api.DELETE("/tasks/:id", s.deleteTask)
 		api.POST("/tasks", bodyLimit(64*1024), s.createTask)
 
 		// peer-to-peer replication endpoint (gateway-to-gateway only,
@@ -121,13 +123,14 @@ func (s *Server) routes() {
 // ---------- Worker endpoints ----------
 
 type registerReq struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"`
-	Name     string `json:"name"`
-	CPU      string `json:"cpu"`
-	Cores    int    `json:"cores"`
-	MemoryMB int    `json:"memory_mb"`
-	Port     int    `json:"port"`
+	ID           string   `json:"id"`
+	Type         string   `json:"type"`
+	Name         string   `json:"name"`
+	CPU          string   `json:"cpu"`
+	Cores        int      `json:"cores"`
+	MemoryMB     int      `json:"memory_mb"`
+	Port         int      `json:"port"`
+	Capabilities []string `json:"capabilities"` // self-reported tools/models; empty = no caps
 }
 
 func (s *Server) registerWorker(c *gin.Context) {
@@ -151,18 +154,19 @@ func (s *Server) registerWorker(c *gin.Context) {
 		host = h
 	}
 	w := &Worker{
-		ID:       req.ID,
-		Type:     req.Type,
-		Name:     req.Name,
-		CPU:      req.CPU,
-		Cores:    req.Cores,
-		MemoryMB: req.MemoryMB,
-		Host:     host,
-		Port:     req.Port,
+		ID:           req.ID,
+		Type:         req.Type,
+		Name:         req.Name,
+		CPU:          req.CPU,
+		Cores:        req.Cores,
+		MemoryMB:     req.MemoryMB,
+		Host:         host,
+		Port:         req.Port,
+		Capabilities: req.Capabilities,
 	}
 	s.store.AddWorker(w)
-	Info("worker registered: id=%s type=%s name=%s cpu=%s cores=%d mem=%dMB",
-		w.ID, w.Type, w.Name, w.CPU, w.Cores, w.MemoryMB)
+	Info("worker registered: id=%s type=%s name=%s cpu=%s cores=%d mem=%dMB caps=%v",
+		w.ID, w.Type, w.Name, w.CPU, w.Cores, w.MemoryMB, w.Capabilities)
 	c.JSON(200, gin.H{"ok": true, "id": w.ID})
 }
 
@@ -345,15 +349,22 @@ func (s *Server) deleteWorker(c *gin.Context) {
 	c.JSON(200, gin.H{"ok": true})
 }
 
+// getStats returns lifetime task counters. Used by the panel's polling
+// fallback when the WS is briefly disconnected, so the KPI doesn't flash 0.
+func (s *Server) getStats(c *gin.Context) {
+	c.JSON(200, s.store.StatsSnapshot())
+}
+
 // ---------- Task endpoints ----------
 
 type createTaskReq struct {
-	Type        string `json:"type"`
-	Payload     string `json:"payload"`
-	Source      string `json:"source"`       // panel | openai
-	Priority    int    `json:"priority"`     // higher = more important
-	MaxRetries  int    `json:"max_retries"`  // 0 = no retry
-	TimeoutSecs int    `json:"timeout_secs"` // 0 = use default 300s
+	Type         string           `json:"type"`
+	Payload      string           `json:"payload"`
+	Source       string           `json:"source"`       // panel | openai
+	Priority     int              `json:"priority"`     // higher = more important
+	MaxRetries   int              `json:"max_retries"`  // 0 = no retry
+	TimeoutSecs  int              `json:"timeout_secs"` // 0 = use default 300s
+	Requirements TaskRequirements `json:"requirements"` // hard filters; empty = no filter
 }
 
 func (s *Server) createTask(c *gin.Context) {
@@ -370,7 +381,7 @@ func (s *Server) createTask(c *gin.Context) {
 		req.Source = "panel"
 	}
 	task, err := s.dispatchTaskWithParams(req.Type, req.Payload, req.Source,
-		req.Priority, req.MaxRetries, req.TimeoutSecs)
+		req.Priority, req.MaxRetries, req.TimeoutSecs, req.Requirements)
 	if err != nil {
 		c.JSON(503, gin.H{"error": err.Error()})
 		return
@@ -379,31 +390,34 @@ func (s *Server) createTask(c *gin.Context) {
 }
 
 func (s *Server) dispatchTask(taskType, payload, source string) (*Task, error) {
-	return s.dispatchTaskWithParams(taskType, payload, source, 0, 0, 0)
+	return s.dispatchTaskWithParams(taskType, payload, source, 0, 0, 0, TaskRequirements{})
 }
 
 // dispatchTaskWithParams creates a task with the given scheduling hints and
 // dispatches it to the best available worker (excluding any worker IDs in
-// excludeWorkerID — used during retry).
+// excludeWorkerID — used during retry). Hard requirements are evaluated by
+// PickWorker before scoring; a worker that fails any requirement is not in
+// the candidate set.
 func (s *Server) dispatchTaskWithParams(taskType, payload, source string,
-	priority, maxRetries, timeoutSecs int, excludeWorkerID ...string) (*Task, error) {
-	worker := s.store.PickWorker(taskType, excludeWorkerID...)
+	priority, maxRetries, timeoutSecs int, requirements TaskRequirements, excludeWorkerID ...string) (*Task, error) {
+	worker := s.store.PickWorker(taskType, requirements, excludeWorkerID...)
 	if worker == nil {
 		return nil, fmt.Errorf("no available worker for type=%s", taskType)
 	}
 	t := &Task{
-		ID:          uuid.NewString(),
-		Type:        taskType,
-		Payload:     payload,
-		Source:      source,
-		Priority:    priority,
-		MaxRetries:  maxRetries,
-		Retries:     0,
-		TimeoutSecs: timeoutSecs,
-		Status:      "pending",
-		Progress:    0,
-		CreatedAt:   time.Now(),
-		Logs:        []string{},
+		ID:           uuid.NewString(),
+		Type:         taskType,
+		Payload:      payload,
+		Source:       source,
+		Priority:     priority,
+		MaxRetries:   maxRetries,
+		Retries:      0,
+		TimeoutSecs:  timeoutSecs,
+		Status:       "pending",
+		Progress:     0,
+		CreatedAt:    time.Now(),
+		Logs:         []string{},
+		Requirements: requirements,
 	}
 	s.store.AddTask(t)
 	s.store.AssignTask(t.ID, worker.ID)
@@ -423,9 +437,9 @@ func (s *Server) retryTask(taskID string, excludeWorkerID string) {
 	// Prefer a different worker than the one that failed; if no alternative
 	// is available (single-worker cluster) reuse the same one — better than
 	// leaving the task stuck in pending forever.
-	worker := s.store.PickWorker(t.Type, excludeWorkerID)
+	worker := s.store.PickWorker(t.Type, t.Requirements, excludeWorkerID)
 	if worker == nil {
-		worker = s.store.PickWorker(t.Type)
+		worker = s.store.PickWorker(t.Type, t.Requirements)
 		if worker == nil {
 			Warn("retryTask: no worker available for type=%s", t.Type)
 			return
@@ -572,6 +586,26 @@ func (s *Server) getTask(c *gin.Context) {
 		return
 	}
 	c.JSON(200, t)
+}
+
+func (s *Server) deleteTask(c *gin.Context) {
+	id := c.Param("id")
+	t := s.store.GetTask(id)
+	if t == nil {
+		c.JSON(404, gin.H{"error": "not found"})
+		return
+	}
+	// If the task is still running, request cancellation first so the
+	// worker stops cleanly. The actual delete happens immediately
+	// regardless of whether the worker has acknowledged.
+	if t.Status == "pending" || t.Status == "running" {
+		if t.WorkerID != "" {
+			go s.pushCancelToWorker(t.WorkerID, id)
+		}
+	}
+	s.store.RemoveTask(id)
+	Info("task deleted: id=%s type=%s was=%s", id, t.Type, t.Status)
+	c.JSON(200, gin.H{"ok": true})
 }
 
 func (s *Server) listModels(c *gin.Context) {
