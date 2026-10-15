@@ -96,11 +96,27 @@ def _exe_dir() -> Path:
 # Config loading: precedence CLI > worker.conf > env > defaults
 # --------------------------------------------------------------------------
 def load_conf_file(path: Path) -> dict:
-    """Parse a `KEY=VALUE` style config file. Lines starting with # are comments."""
+    """Parse a `KEY=VALUE` style config file. Lines starting with # are comments.
+
+    Tries utf-8-sig, utf-8, gbk, latin-1 in that order — the file is
+    often edited on Windows where PowerShell's `Set-Content` defaults to
+    the system codepage (GBK on zh-CN), and PyInstaller's bundled Python
+    will otherwise crash on those bytes.
+    """
     cfg: dict = {}
     if not path.exists():
         return cfg
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    raw_text: str | None = None
+    for enc in ("utf-8-sig", "utf-8", "gbk", "latin-1"):
+        try:
+            raw_text = path.read_text(encoding=enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if raw_text is None:
+        # Last resort: decode with replacement, never crash on encoding.
+        raw_text = path.read_bytes().decode("utf-8", errors="replace")
+    for raw in raw_text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue

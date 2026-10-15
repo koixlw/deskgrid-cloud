@@ -57,6 +57,36 @@ import requests
 
 
 # --------------------------------------------------------------------------
+# Interpreter resolution — workers run inside a sandboxed PATH that only
+# contains C:\Windows / /usr/bin. To still be able to invoke `python`,
+# `python3`, `ffmpeg`, etc., we resolve the *current* interpreter / common
+# binaries to an absolute path on the client side BEFORE submitting.
+# --------------------------------------------------------------------------
+def _resolve_cmd(cmd: list[str]) -> list[str]:
+    """If cmd[0] is a well-known relative name (python, python3, ffmpeg,
+    ...), try to resolve to an absolute path. Falls through silently if
+    the user already gave an absolute path or the name isn't recognised.
+    """
+    if not cmd:
+        return cmd
+    first = cmd[0]
+    if os.path.isabs(first):
+        return cmd
+    base = os.path.basename(first).lower()
+    # Always try to resolve bare "python*" to the current interpreter first —
+    # this is what the user most likely means.
+    if base in ("python", "python3", "python.exe") and sys.executable:
+        if os.path.basename(sys.executable).lower().startswith("python"):
+            return [sys.executable] + cmd[1:]
+    # Fall back to PATH lookup so `ffmpeg`, `edge-tts`, etc. work too.
+    from shutil import which
+    found = which(first)
+    if found:
+        return [found] + cmd[1:]
+    return cmd
+
+
+# --------------------------------------------------------------------------
 # Conf loader — duplicated from worker_launcher.py to avoid pulling fastapi
 # into the client bundle. ~15 lines, kept faithful to the original.
 # --------------------------------------------------------------------------
@@ -79,8 +109,17 @@ def load_conf(explicit: Optional[str]) -> dict:
     p = _find_conf(explicit)
     if not p:
         return {}
+    raw_text: str | None = None
+    for enc in ("utf-8-sig", "utf-8", "gbk", "latin-1"):
+        try:
+            raw_text = p.read_text(encoding=enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if raw_text is None:
+        raw_text = p.read_bytes().decode("utf-8", errors="replace")
     cfg = {}
-    for raw in p.read_text(encoding="utf-8").splitlines():
+    for raw in raw_text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -195,6 +234,7 @@ def decide_mode(args, cfg) -> tuple[str, str]:
 # --------------------------------------------------------------------------
 def run_local(cmd: list[str], cwd: Optional[str], env: dict) -> int:
     """Passthrough subprocess.run, return exit code."""
+    cmd = _resolve_cmd(cmd)
     print(f"[local] running: {' '.join(cmd)}  (cwd={cwd or os.getcwd()})", file=sys.stderr)
     merged_env = os.environ.copy()
     merged_env.update(env)
@@ -213,6 +253,7 @@ def submit_remote(gateway: str, cmd: list[str], cwd: Optional[str], env: dict,
                    timeout: int, priority: int, max_retries: int,
                    token: str, secret: str, watch: bool, poll_ms: int,
                    quiet: bool) -> int:
+    cmd = _resolve_cmd(cmd)
     payload_obj = {"cmd": cmd}
     if cwd:
         payload_obj["cwd"] = cwd
