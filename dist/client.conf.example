@@ -1,0 +1,19 @@
+# deskgrid-cloud client config — deskgrid-submit
+# Place this file next to deskgrid-client.exe and rename to client.conf.
+# Lines starting with # are comments. CLI flags always override these.
+
+# Gateway URL (the deskgrid-cloud main node)
+GATEWAY=http://192.168.1.178:13000
+
+# Bearer token (matches gateway's GATEWAY_TOKEN). Leave empty in dev mode.
+GATEWAY_TOKEN=
+
+# HMAC secret (matches gateway's GATEWAY_HMAC_SECRET). Leave empty in dev.
+GATEWAY_HMAC_SECRET=
+
+# Auto-mode thresholds. CPU% / Mem% above either → submit to gateway.
+CPU_THRESHOLD=80
+MEM_THRESHOLD=85
+
+# When --mode auto and no exec worker online: 1=fallback to local, 0=fail.
+LOCAL_FALLBACK=1

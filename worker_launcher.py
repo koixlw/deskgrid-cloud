@@ -70,11 +70,13 @@ DISPATCH_BY_TYPE: dict[str, dict[str, str]] = {
         "video_add_subtitle": "add_subtitle",
         "video_kenburns": "kenburns",
     },
+    "exec":  {"exec_run": "exec_cmd"},
 }
 
 DEFAULT_PORT_BY_TYPE = {
     "code":  3001, "doc": 3002, "csv": 3003,
     "image": 3004, "audio": 3005, "video": 3006,
+    "exec":  3007,
 }
 
 

@@ -140,8 +140,9 @@ func (s *Server) registerWorker(c *gin.Context) {
 		req.ID = uuid.NewString()
 	}
 	if req.Type == "" || (req.Type != "code" && req.Type != "doc" && req.Type != "csv" &&
-		req.Type != "image" && req.Type != "audio" && req.Type != "video") {
-		c.JSON(400, gin.H{"error": "type must be code | doc | csv | image | audio | video"})
+		req.Type != "image" && req.Type != "audio" && req.Type != "video" &&
+		req.Type != "exec") {
+		c.JSON(400, gin.H{"error": "type must be code | doc | csv | image | audio | video | exec"})
 		return
 	}
 	host := c.ClientIP()

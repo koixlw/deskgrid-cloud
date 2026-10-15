@@ -51,6 +51,14 @@ type Usage struct {
 // Returns taskType and the payload to forward to the worker.
 func classifyTask(content string) (string, string, error) {
 	low := strings.ToLower(content)
+	// SECURITY: never auto-dispatch exec / shell tasks via natural language.
+	// exec_run executes arbitrary commands on worker hosts and must only be
+	// dispatched by a trusted admin client (deskgrid-submit --mode remote).
+	for _, kw := range []string{"exec", "shell", "shell_exec", "cmd.exe", "/bin/bash", "powershell", "run command"} {
+		if strings.Contains(low, kw) {
+			return "", "", fmt.Errorf("shell/exec tasks cannot be triggered via the OpenAI bridge; use deskgrid-submit directly")
+		}
+	}
 	// explicit code/format
 	if strings.Contains(low, "格式化") || strings.Contains(low, "format") ||
 		strings.Contains(low, "代码重构") || strings.Contains(low, "refactor") ||

@@ -88,6 +88,7 @@ ALL_WORKERS = [
     ("image", "workers/image/main.py", 3004),
     ("audio", "workers/audio/main.py", 3005),
     ("video", "workers/video/main.py", 3006),
+    ("exec",  "workers/exec/main.py",  3007),
 ]
 
 

@@ -54,6 +54,7 @@ python -m PyInstaller ^
     --hidden-import "workers.image.tasks" ^
     --hidden-import "workers.audio.tasks" ^
     --hidden-import "workers.video.tasks" ^
+    --hidden-import "workers.exec.tasks" ^
     --hidden-import "common.base" ^
     --hidden-import "common.hardware" ^
     --hidden-import "requests" ^
