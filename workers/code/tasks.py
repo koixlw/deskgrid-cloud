@@ -4,8 +4,13 @@ All tasks receive (task_id, payload: str, reporter) and return a JSON-serializab
 Real work happens here — no mocks.
 """
 import ast
+import os
 import re
+import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.base import cancellable_sleep  # noqa: E402
 
 
 def _parse_or_none(src: str):
@@ -15,13 +20,13 @@ def _parse_or_none(src: str):
         return e
 
 
-def format_code(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
+def format_code(task_id: str, payload: str, reporter, cancel_event=None, pause_event=None) -> dict:
     """Reformat Python source code using ast.parse + ast.unparse.
 
     For code that can't be parsed, fall back to whitespace normalization.
     """
     reporter.progress(10, "[format] 解析 AST")
-    time.sleep(0.2)
+    cancellable_sleep(0.2, cancel_event, pause_event)
     tree = _parse_or_none(payload)
     if isinstance(tree, ast.AST):
         reporter.progress(40, "[format] AST 解析成功，开始 unparse")
@@ -63,10 +68,10 @@ def format_code(task_id: str, payload: str, reporter, cancel_event=None) -> dict
         }
 
 
-def count_ast(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
+def count_ast(task_id: str, payload: str, reporter, cancel_event=None, pause_event=None) -> dict:
     """Count functions, classes, loops, branches, and max nesting depth."""
     reporter.progress(15, "[ast] 解析")
-    time.sleep(0.2)
+    cancellable_sleep(0.2, cancel_event, pause_event)
     tree = _parse_or_none(payload)
     if isinstance(tree, SyntaxError):
         return {"success": False, "error": f"语法错误: {tree.msg} (line {tree.lineno})"}
@@ -117,10 +122,10 @@ def count_ast(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
                 counts["import"] += 1
 
     reporter.progress(50, "[ast] 遍历 AST")
-    time.sleep(0.3)
+    cancellable_sleep(0.3, cancel_event, pause_event)
     Visitor().visit(tree)
     reporter.progress(90, "[ast] 汇总")
-    time.sleep(0.1)
+    cancellable_sleep(0.1, cancel_event, pause_event)
     counts["max_nesting_depth"] = max_depth[0]
     counts["source_lines"] = len(payload.splitlines())
     counts["source_chars"] = len(payload)

@@ -6,7 +6,7 @@ import random
 import sys
 import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.base import TaskCancelled  # noqa: E402
+from common.base import TaskCancelled, cancellable_sleep, wait_if_paused  # noqa: E402
 
 
 def _parse_numbers(payload: str) -> list[float]:
@@ -29,7 +29,7 @@ def _parse_numbers(payload: str) -> list[float]:
     return out
 
 
-def montecarlo(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
+def montecarlo(task_id: str, payload: str, reporter, cancel_event=None, pause_event=None) -> dict:
     """Run a Monte Carlo simulation.
 
     Payload formats accepted:
@@ -38,7 +38,7 @@ def montecarlo(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     - Bare integer N (defaults to uniform[0,1], N samples)
     """
     reporter.progress(5, "[mc] 解析参数")
-    time.sleep(0.15)
+    cancellable_sleep(0.15, cancel_event, pause_event)
     config = {"samples": 10000, "distribution": "uniform", "low": 0.0, "high": 1.0,
               "mean": 0.0, "stddev": 1.0, "rate": 1.0}
     try:
@@ -56,7 +56,7 @@ def montecarlo(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     n = max(1, min(10_000_000, int(config["samples"])))
     dist = config["distribution"]
     reporter.progress(15, f"[mc] 采样 {n} 次，分布={dist}")
-    time.sleep(0.1)
+    cancellable_sleep(0.1, cancel_event, pause_event)
 
     # sampling loop with progress reporting every ~5%
     samples = []
@@ -66,8 +66,12 @@ def montecarlo(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
         for i in range(n):
             if cancel_event and cancel_event.is_set():
                 raise TaskCancelled(f"montecarlo uniform cancelled at {i}/{n}")
+            # Cooperative pause: honor pause_event at each chunk boundary
+            # (the progress call below already blocks; chunk check keeps it
+            # responsive for very long loops without spamming progress).
             samples.append(random.uniform(lo, hi))
             if (i + 1) % chunk == 0:
+                wait_if_paused(pause_event, cancel_event)
                 pct = 15 + int(70 * (i + 1) / n)
                 reporter.progress(pct, f"[mc] uniform 采样 {i+1}/{n}")
     elif dist == "normal":
@@ -77,6 +81,7 @@ def montecarlo(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
                 raise TaskCancelled(f"montecarlo normal cancelled at {i}/{n}")
             samples.append(random.gauss(mu, sigma))
             if (i + 1) % chunk == 0:
+                wait_if_paused(pause_event, cancel_event)
                 pct = 15 + int(70 * (i + 1) / n)
                 reporter.progress(pct, f"[mc] normal 采样 {i+1}/{n}")
     elif dist == "exponential":
@@ -86,6 +91,7 @@ def montecarlo(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
                 raise TaskCancelled(f"montecarlo exp cancelled at {i}/{n}")
             samples.append(random.expovariate(rate))
             if (i + 1) % chunk == 0:
+                wait_if_paused(pause_event, cancel_event)
                 pct = 15 + int(70 * (i + 1) / n)
                 reporter.progress(pct, f"[mc] exp 采样 {i+1}/{n}")
     else:
@@ -119,15 +125,15 @@ def montecarlo(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
     }
 
 
-def stats(task_id: str, payload: str, reporter, cancel_event=None) -> dict:
+def stats(task_id: str, payload: str, reporter, cancel_event=None, pause_event=None) -> dict:
     """Compute descriptive statistics for a list of numbers."""
     reporter.progress(15, "[stats] 解析数字")
-    time.sleep(0.15)
+    cancellable_sleep(0.15, cancel_event, pause_event)
     nums = _parse_numbers(payload)
     if not nums:
         return {"success": False, "error": "no numbers found"}
     reporter.progress(40, f"[stats] 共 {len(nums)} 个数字")
-    time.sleep(0.15)
+    cancellable_sleep(0.15, cancel_event, pause_event)
 
     nums_sorted = sorted(nums)
     n = len(nums)

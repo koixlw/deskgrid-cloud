@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.base import TaskCancelled  # noqa: E402
+from common.base import TaskCancelled, wait_if_paused  # noqa: E402
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -146,13 +146,16 @@ def _parse_payload(payload):
     return {}
 
 
-def _check_cancel(cancel_event, where: str):
+def _check_cancel(cancel_event, where: str, pause_event=None):
+    """Cancel check + cooperative pause at a frame boundary."""
+    if pause_event is not None:
+        wait_if_paused(pause_event, cancel_event)
     if cancel_event is not None and cancel_event.is_set():
         raise TaskCancelled(f"cancelled at {where}")
 
 
 # ---------- tasks ----------
-def assemble_clip(task_id, payload, reporter, cancel_event=None):
+def assemble_clip(task_id, payload, reporter, cancel_event=None, pause_event=None):
     """Build a slideshow mp4 from a list of scene descriptions.
 
     Payload (dict or str):
@@ -176,7 +179,7 @@ def assemble_clip(task_id, payload, reporter, cancel_event=None):
     frames: list[Image.Image] = []
     for i, scene in enumerate(scenes):
         for f in range(n_per):
-            _check_cancel(cancel_event, f"clip scene {i+1} frame {f+1}")
+            _check_cancel(cancel_event, f"clip scene {i+1} frame {f+1}", pause_event)
             frames.append(_gradient_frame(width, height, i, scene))
         reporter.progress(15 + 80 * (i + 1) // len(scenes),
                           f"[clip] scene {i+1}/{len(scenes)}")
@@ -190,7 +193,7 @@ def assemble_clip(task_id, payload, reporter, cancel_event=None):
     return info
 
 
-def add_subtitle(task_id, payload, reporter, cancel_event=None):
+def add_subtitle(task_id, payload, reporter, cancel_event=None, pause_event=None):
     """Build a slideshow mp4 where each scene gets its own subtitle overlay.
 
     Payload:
@@ -218,7 +221,7 @@ def add_subtitle(task_id, payload, reporter, cancel_event=None):
     for i, scene in enumerate(scenes):
         sub = subtitles[i] if i < len(subtitles) else scene
         for f in range(n_per):
-            _check_cancel(cancel_event, f"sub scene {i+1} frame {f+1}")
+            _check_cancel(cancel_event, f"sub scene {i+1} frame {f+1}", pause_event)
             frames.append(_gradient_frame(width, height, i, scene, subtitle=sub))
         reporter.progress(15 + 80 * (i + 1) // len(scenes),
                           f"[sub] scene {i+1}/{len(scenes)}")
@@ -232,7 +235,7 @@ def add_subtitle(task_id, payload, reporter, cancel_event=None):
     return info
 
 
-def kenburns(task_id, payload, reporter, cancel_event=None):
+def kenburns(task_id, payload, reporter, cancel_event=None, pause_event=None):
     """Cinematic zoom/pan over a single generated frame.
 
     Payload:
@@ -270,7 +273,7 @@ def kenburns(task_id, payload, reporter, cancel_event=None):
     reporter.progress(25, f"[kb] {nframes} frames @ {fps}fps direction={direction}")
     frames: list[Image.Image] = []
     for i in range(nframes):
-        _check_cancel(cancel_event, f"kenburns frame {i+1}/{nframes}")
+        _check_cancel(cancel_event, f"kenburns frame {i+1}/{nframes}", pause_event)
         t = i / max(nframes - 1, 1)
         if direction == "in":
             scale = 1.0 + (zoom - 1.0) * t

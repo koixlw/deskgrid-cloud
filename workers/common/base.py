@@ -113,8 +113,9 @@ class TaskCancelled(Exception):
     pass
 
 
-def cancellable_sleep(seconds: float, cancel_event, step: float = 0.5) -> None:
-    """Sleep that wakes up early when cancellation is requested.
+def cancellable_sleep(seconds: float, cancel_event, pause_event=None, step: float = 0.5) -> None:
+    """Sleep that wakes up early when cancellation is requested, and blocks
+    while pause_event is set (deadline does NOT drift during pause).
 
     Works with both threading.Event (in-process) and multiprocessing.Event
     (cross-process). For multiprocessing.Event, is_set() is a syscall, so we
@@ -126,6 +127,14 @@ def cancellable_sleep(seconds: float, cancel_event, step: float = 0.5) -> None:
     while time.time() < end:
         if cancel_event.is_set():
             raise TaskCancelled("cancelled during sleep")
+        if pause_event is not None and pause_event.is_set():
+            # Block until pause clears (or cancel fires). Push the absolute
+            # deadline forward by the pause duration so the original sleep
+            # budget is preserved.
+            pause_started = time.time()
+            wait_if_paused(pause_event, cancel_event)
+            end += time.time() - pause_started
+            continue
         time.sleep(min(step, end - time.time()))
 
 
@@ -133,6 +142,25 @@ def check_cancel(cancel_event, label: str = "") -> None:
     """Raise TaskCancelled immediately if cancellation has been requested."""
     if cancel_event is not None and cancel_event.is_set():
         raise TaskCancelled(f"cancelled{' at ' + label if label else ''}")
+
+
+def wait_if_paused(pause_event, cancel_event=None, step: float = 0.05) -> None:
+    """Block while pause_event is set; raise TaskCancelled if cancel fires.
+
+    Cooperative — the caller decides when to check. step is the polling
+    interval in seconds; small enough that resume feels instant.
+    """
+    if pause_event is None:
+        return
+    while pause_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            raise TaskCancelled("cancelled while paused")
+        time.sleep(step)
+
+
+def check_pause(pause_event, cancel_event=None) -> None:
+    """Block until pause is cleared (with cancel short-circuit)."""
+    wait_if_paused(pause_event, cancel_event)
 
 
 def _stable_worker_id(port: int, worker_type: str) -> str:
@@ -156,20 +184,103 @@ def _stable_worker_id(port: int, worker_type: str) -> str:
     return f"uuid:{worker_type}:{port}:{uuid.uuid4().hex}"
 
 
-def _read_gpu_info() -> tuple[int, int]:
-    """Best-effort GPU memory read. Returns (used_mb, total_mb)."""
+def _detect_gpus() -> list[dict]:
+    """Enumerate every GPU on this host exactly once at import time.
+
+    Returns a list of ``{index, name, uuid}`` records in physical slot order.
+    GPUs are not hot-plugged on the workers we target, so caching the
+    (index, model, uuid) trio at startup is fine — and keeps each heartbeat
+    cheap (we only re-query the volatile bits: memory + temperature).
+
+    Returns ``[]`` if pynvml isn't installed or NVML fails to initialise.
+    """
     try:
         import pynvml  # type: ignore
         pynvml.nvmlInit()
-        handle = pynvmlDeviceGetHandleByIndex(0)
-        mem = pynvmlDeviceGetMemoryInfo(handle)
-        return (int(mem.used // (1024 * 1024)), int(mem.total // (1024 * 1024)))
+        n = pynvml.nvmlDeviceGetCount()
+        out: list[dict] = []
+        for i in range(n):
+            try:
+                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                try:
+                    name = pynvml.nvmlDeviceGetName(h)
+                    if isinstance(name, bytes):
+                        name = name.decode("utf-8", errors="replace")
+                except Exception:
+                    name = f"GPU #{i}"
+                try:
+                    uuid = pynvml.nvmlDeviceGetUUID(h)
+                    if isinstance(uuid, bytes):
+                        uuid = uuid.decode("utf-8", errors="replace")
+                except Exception:
+                    uuid = ""
+            except Exception:
+                # pynvml can fail on a single bad device without killing the rest
+                continue
+            out.append({"index": int(i), "name": str(name), "uuid": str(uuid)})
+        return out
     except Exception:
-        return (0, 0)
+        return []
+
+
+# Cache the device table at import. _GPU_TABLE may be [] on a non-GPU host;
+# that's fine — the heartbeat / register paths become no-ops for GPU fields.
+_GPU_TABLE: list[dict] = _detect_gpus()
+
+
+def _read_gpu_info() -> tuple[int, int, list[dict]]:
+    """Best-effort read of every GPU's memory + temperature.
+
+    Returns ``(used_mb, total_mb, detail)`` where ``used_mb`` / ``total_mb``
+    are the primary (lowest-index) GPU's bytes — preserved as a scalar pair
+    so the gateway's existing ``MinGPUFreeMB`` scheduler check keeps working
+    unchanged. ``detail`` is the per-card list for the dashboard:
+
+        [{"index": 0, "name": "NVIDIA GeForce RTX 2080",
+          "mem_used_mb": 1234, "mem_total_mb": 8192, "temp_c": 42}, ...]
+
+    Hosts without pynvml (CPU-only workers, Apple Silicon, etc.) yield
+    ``(0, 0, [])``.
+    """
+    if not _GPU_TABLE:
+        return 0, 0, []
+    detail: list[dict] = []
+    primary_used = primary_total = 0
+    try:
+        import pynvml  # type: ignore
+        pynvml.nvmlInit()
+        for entry in _GPU_TABLE:
+            idx = entry["index"]
+            try:
+                h = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                used_mb = int(mem.used // (1024 * 1024))
+                total_mb = int(mem.total // (1024 * 1024))
+            except Exception:
+                used_mb = total_mb = 0
+            temp_c = 0
+            try:
+                temp_c = int(pynvml.nvmlDeviceGetTemperature(
+                    h, pynvml.NVML_TEMPERATURE_GPU))
+            except Exception:
+                pass
+            detail.append({
+                "index":        idx,
+                "name":         entry["name"],
+                "mem_used_mb":  used_mb,
+                "mem_total_mb": total_mb,
+                "temp_c":       temp_c,
+            })
+        if detail:
+            primary_used = detail[0]["mem_used_mb"]
+            primary_total = detail[0]["mem_total_mb"]
+    except Exception:
+        pass
+    return primary_used, primary_total, detail
 
 
 def _task_subprocess_entry(gateway: str, worker_id: str, task_id: str, task_type: str,
-                           payload, fn_bytes: bytes, cancel_event):
+                           payload, fn_bytes: bytes, cancel_event, pause_event=None):
     """Runs in a fresh subprocess. Picks up the task function from its module
     path (fn_bytes) and executes it. Posts result to gateway directly.
 
@@ -251,10 +362,22 @@ def _task_subprocess_entry(gateway: str, worker_id: str, task_id: str, task_type
 
     class SubprocessReporter:
         def progress(self, pct, log=""):
+            # Cooperative pause: every progress report is a natural checkpoint.
+            # Block here while pause_event is set so the dashboard sees the
+            # task "frozen" between updates.
+            if pause_event is not None:
+                wait_if_paused(pause_event, cancel_event)
             post_progress(int(pct), log or "")
 
     try:
-        result = fn(task_id, payload, SubprocessReporter(), cancel_event) or {}
+        # pass pause_event as a keyword-ish last arg; tasks.py signature is
+        # (task_id, payload, reporter, cancel_event, pause_event=None) — None
+        # default keeps backward compat with old task definitions.
+        result = fn(task_id, payload, SubprocessReporter(), cancel_event, pause_event) or {}
+        # Final pause check before posting: a task that finishes while paused
+        # shouldn't get to "done" without the operator choosing to resume.
+        if pause_event is not None:
+            wait_if_paused(pause_event, cancel_event)
         if cancel_event.is_set():
             post_result(False, error="cancelled")
         else:
@@ -291,7 +414,10 @@ class BaseWorker:
         self.queue_len = 0
         self._lock = threading.Lock()
         self._cancel_event = None  # mp.Event shared with subprocess
+        self._pause_event: Optional[multiprocessing.Event] = None  # mp.Event for cooperative pause
         self._current_proc: Optional[multiprocessing.Process] = None
+        self._watchdog: Optional[threading.Timer] = None  # timeout watchdog (cancellable on pause)
+        self._task_started_monotonic: Optional[float] = None  # wall time at task start
         self._tasks_completed = 0
         self._restart_requested = threading.Event()
 
@@ -364,37 +490,103 @@ class BaseWorker:
                 self._cancel_event.set()
             return {"ok": True, "task_id": task_id}
 
+        @self.app.post("/task/pause")
+        def handle_pause(req: dict):
+            task_id = req.get("task_id")
+            if not task_id:
+                raise HTTPException(400, "task_id required")
+            if task_id != self.current_task_id:
+                raise HTTPException(409, f"task {task_id} not running on this worker")
+            log.info("pause requested for task %s", task_id)
+            with self._lock:
+                if self._pause_event is not None:
+                    self._pause_event.set()
+                if self._watchdog is not None:
+                    self._watchdog.cancel()
+                    self._watchdog = None
+            return {"ok": True, "task_id": task_id}
+
+        @self.app.post("/task/resume")
+        def handle_resume(req: dict):
+            task_id = req.get("task_id")
+            if not task_id:
+                raise HTTPException(400, "task_id required")
+            if task_id != self.current_task_id:
+                raise HTTPException(409, f"task {task_id} not running on this worker")
+            log.info("resume requested for task %s", task_id)
+            with self._lock:
+                if self._pause_event is not None:
+                    self._pause_event.clear()
+                # Restart the watchdog with whatever time was left on the
+                # original budget so a paused-then-resumed task still gets
+                # DEFAULT_TIMEOUT_DEFAULT total wall-clock to finish.
+                if self._task_started_monotonic is not None and self._watchdog is None:
+                    elapsed = time.monotonic() - self._task_started_monotonic
+                    remaining = max(1, int(DEFAULT_TIMEOUT_DEFAULT - elapsed))
+                    self._watchdog = threading.Timer(remaining, self._fire_watchdog)
+                    self._watchdog.daemon = True
+                    self._watchdog.start()
+            return {"ok": True, "task_id": task_id}
+
+        @self.app.post("/task/stop")
+        def handle_stop(req: dict):
+            task_id = req.get("task_id")
+            if not task_id:
+                raise HTTPException(400, "task_id required")
+            if task_id != self.current_task_id:
+                raise HTTPException(409, f"task {task_id} not running on this worker")
+            log.warning("stop requested for task %s — terminating subprocess", task_id)
+            # Cooperative signal first (lets a well-behaved task exit cleanly),
+            # then forcibly terminate the subprocess so we don't wait for it.
+            with self._lock:
+                if self._pause_event is not None:
+                    self._pause_event.clear()
+                if self._cancel_event is not None:
+                    self._cancel_event.set()
+            self._fire_watchdog()
+            return {"ok": True, "task_id": task_id}
+
         @self.app.post("/admin/restart")
         def admin_restart():
             self._restart_requested.set()
             return {"ok": True}
 
     # ---------- Execution ----------
+    def _fire_watchdog(self):
+        """Force-terminate the current subprocess. Called by the timeout
+        watchdog OR by an operator-initiated stop. Idempotent."""
+        with self._lock:
+            proc = self._current_proc
+        if proc is None:
+            return
+        try:
+            if proc.is_alive():
+                log.warning("watchdog/stop firing: terminating subprocess pid=%d", proc.pid)
+                proc.terminate()
+                proc.join(timeout=3)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join()
+        except Exception as e:
+            log.error("watchdog error: %s", e)
+
     def _execute(self, task_id: str, task_type: str, payload, fn: Callable):
         cancel_event = self._mp_ctx.Event()
+        pause_event = self._mp_ctx.Event()
         with self._lock:
             self.current_task_id = task_id
             self._cancel_event = cancel_event
+            self._pause_event = pause_event
+            self._task_started_monotonic = time.monotonic()
 
         # Watchdog timer: hard-kill the subprocess after DEFAULT_TIMEOUT_DEFAULT
         # seconds if the task is still running. Because the subprocess runs in
         # its own process, terminate() really does kill it (no GIL, no shared
-        # state to corrupt).
-        def fire_watchdog():
-            try:
-                if self._current_proc and self._current_proc.is_alive():
-                    log.warning("watchdog firing: terminating subprocess for task %s (pid %d)",
-                        task_id, self._current_proc.pid)
-                    self._current_proc.terminate()
-                    self._current_proc.join(timeout=3)
-                    if self._current_proc.is_alive():
-                        self._current_proc.kill()
-            except Exception as e:
-                log.error("watchdog error: %s", e)
-
-        watchdog = threading.Timer(DEFAULT_TIMEOUT_DEFAULT, fire_watchdog)
-        watchdog.daemon = True
-        watchdog.start()
+        # state to corrupt). Stored on self so /task/pause can cancel it.
+        with self._lock:
+            self._watchdog = threading.Timer(DEFAULT_TIMEOUT_DEFAULT, self._fire_watchdog)
+            self._watchdog.daemon = True
+            self._watchdog.start()
 
         # Locate the task function by module+name so the subprocess can import
         # and call it (multiprocessing can't pickle local functions).
@@ -404,7 +596,8 @@ class BaseWorker:
 
         proc = self._mp_ctx.Process(
             target=_task_subprocess_entry,
-            args=(self.gateway, self.worker_id, task_id, task_type, payload, fn_info, cancel_event),
+            args=(self.gateway, self.worker_id, task_id, task_type, payload, fn_info,
+                  cancel_event, pause_event),
             daemon=True,
         )
         with self._lock:
@@ -430,12 +623,16 @@ class BaseWorker:
             elif proc.exitcode != 0 and proc.exitcode is not None:
                 log.warning("task %s subprocess exitcode=%s", task_id, proc.exitcode)
         finally:
-            watchdog.cancel()
             with self._lock:
+                if self._watchdog is not None:
+                    self._watchdog.cancel()
+                    self._watchdog = None
                 if self.current_task_id == task_id:
                     self.current_task_id = None
                     self._cancel_event = None
+                    self._pause_event = None
                     self._current_proc = None
+                    self._task_started_monotonic = None
                 self._tasks_completed += 1
             if self._tasks_completed >= DEFAULT_RESTART_AFTER_TASKS:
                 log.warning("reached %d tasks, requesting self-restart",
@@ -446,6 +643,7 @@ class BaseWorker:
     def register(self):
         hw = collect_hw()
         caps = collect_caps(self.worker_type)
+        _, _, gpu_detail = _read_gpu_info()
         body = {
             "id": self.worker_id,
             "type": self.worker_type,
@@ -455,6 +653,11 @@ class BaseWorker:
             "memory_mb": hw["memory_mb"],
             "port": self.port,
             "capabilities": caps,
+            # GPU info reported once at register, repeated each heartbeat so
+            # the gateway knows what hardware it's talking to without
+            # needing to learn it from the heartbeat stream.
+            "gpus": gpu_detail,
+            "gpu_count": len(gpu_detail),
         }
         last_err = None
         for attempt in range(10):
@@ -486,13 +689,15 @@ class BaseWorker:
                     os._exit(0)
                 try:
                     usage = snapshot_usage()
-                    gpu_used, gpu_total = _read_gpu_info()
+                    gpu_used, gpu_total, gpu_detail = _read_gpu_info()
                     body = {
                         "cpu_usage": usage["cpu_usage"],
                         "mem_usage": usage["mem_usage"],
                         "queue_len": self.queue_len,
                         "gpu_mem_used_mb": gpu_used,
                         "gpu_mem_total_mb": gpu_total,
+                        "gpus": gpu_detail,
+                        "gpu_count": len(gpu_detail),
                     }
                     r = signed_post(
                         f"{self.gateway}/api/workers/{self.worker_id}/heartbeat",

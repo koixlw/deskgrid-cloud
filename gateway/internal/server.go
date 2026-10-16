@@ -103,6 +103,10 @@ func (s *Server) routes() {
 		api.GET("/tasks/:id", s.getTask)
 		api.DELETE("/tasks/:id", s.deleteTask)
 		api.POST("/tasks", bodyLimit(64*1024), s.createTask)
+		api.POST("/tasks/:id/pause", bodyLimit(1024), s.pauseTask)
+		api.POST("/tasks/:id/resume", bodyLimit(1024), s.resumeTask)
+		api.POST("/tasks/:id/stop", bodyLimit(1024), s.stopTask)
+		api.POST("/tasks/:id/start", bodyLimit(1024), s.startTask)
 
 		// peer-to-peer replication endpoint (gateway-to-gateway only,
 		// not auth-protected because it sits on internal network)
@@ -123,14 +127,16 @@ func (s *Server) routes() {
 // ---------- Worker endpoints ----------
 
 type registerReq struct {
-	ID           string   `json:"id"`
-	Type         string   `json:"type"`
-	Name         string   `json:"name"`
-	CPU          string   `json:"cpu"`
-	Cores        int      `json:"cores"`
-	MemoryMB     int      `json:"memory_mb"`
-	Port         int      `json:"port"`
-	Capabilities []string `json:"capabilities"` // self-reported tools/models; empty = no caps
+	ID           string      `json:"id"`
+	Type         string      `json:"type"`
+	Name         string      `json:"name"`
+	CPU          string      `json:"cpu"`
+	Cores        int         `json:"cores"`
+	MemoryMB     int         `json:"memory_mb"`
+	Port         int         `json:"port"`
+	Capabilities []string    `json:"capabilities"` // self-reported tools/models; empty = no caps
+	GPUs         []GPUDetail `json:"gpus"`         // per-card detail; absent on CPU-only hosts
+	GPUCount     int         `json:"gpu_count"`    // convenience: len(GPUs); 0 on CPU hosts
 }
 
 func (s *Server) registerWorker(c *gin.Context) {
@@ -153,29 +159,43 @@ func (s *Server) registerWorker(c *gin.Context) {
 	if h := c.GetHeader("X-Worker-Host"); h != "" {
 		host = h
 	}
+	// Take the primary GPU's scalar memory (the one the scheduler's
+	// MinGPUFreeMB check looks at) from the first GPU record. If the
+	// worker reports no GPUs (CPU-only host), both scalars stay 0.
+	var primaryUsed, primaryTotal int64
+	if len(req.GPUs) > 0 {
+		primaryUsed = req.GPUs[0].MemUsedMB
+		primaryTotal = req.GPUs[0].MemTotalMB
+	}
 	w := &Worker{
-		ID:           req.ID,
-		Type:         req.Type,
-		Name:         req.Name,
-		CPU:          req.CPU,
-		Cores:        req.Cores,
-		MemoryMB:     req.MemoryMB,
-		Host:         host,
-		Port:         req.Port,
-		Capabilities: req.Capabilities,
+		ID:            req.ID,
+		Type:          req.Type,
+		Name:          req.Name,
+		CPU:           req.CPU,
+		Cores:         req.Cores,
+		MemoryMB:      req.MemoryMB,
+		Host:          host,
+		Port:          req.Port,
+		Capabilities:  req.Capabilities,
+		GPUs:          req.GPUs,
+		GPUCount:      len(req.GPUs),
+		GPUMemUsedMB:  primaryUsed,
+		GPUMemTotalMB: primaryTotal,
 	}
 	s.store.AddWorker(w)
-	Info("worker registered: id=%s type=%s name=%s cpu=%s cores=%d mem=%dMB caps=%v",
-		w.ID, w.Type, w.Name, w.CPU, w.Cores, w.MemoryMB, w.Capabilities)
+	Info("worker registered: id=%s type=%s name=%s cpu=%s cores=%d mem=%dMB caps=%v gpus=%d",
+		w.ID, w.Type, w.Name, w.CPU, w.Cores, w.MemoryMB, w.Capabilities, w.GPUCount)
 	c.JSON(200, gin.H{"ok": true, "id": w.ID})
 }
 
 type heartbeatReq struct {
-	CPUUsage      float64 `json:"cpu_usage"`
-	MemUsage      float64 `json:"mem_usage"`
-	QueueLen      int     `json:"queue_len"`
-	GPUMemUsedMB  int64   `json:"gpu_mem_used_mb"`
-	GPUMemTotalMB int64   `json:"gpu_mem_total_mb"`
+	CPUUsage      float64    `json:"cpu_usage"`
+	MemUsage      float64    `json:"mem_usage"`
+	QueueLen      int        `json:"queue_len"`
+	GPUMemUsedMB  int64      `json:"gpu_mem_used_mb"`
+	GPUMemTotalMB int64      `json:"gpu_mem_total_mb"`
+	GPUs          []GPUDetail `json:"gpus"`
+	GPUCount      int        `json:"gpu_count"`
 }
 
 func (s *Server) heartbeat(c *gin.Context) {
@@ -185,7 +205,8 @@ func (s *Server) heartbeat(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	w := s.store.UpdateHeartbeat(id, req.CPUUsage, req.MemUsage, req.QueueLen, req.GPUMemUsedMB, req.GPUMemTotalMB)
+	w := s.store.UpdateHeartbeat(id, req.CPUUsage, req.MemUsage, req.QueueLen,
+		req.GPUMemUsedMB, req.GPUMemTotalMB, req.GPUs)
 	if w == nil {
 		c.JSON(404, gin.H{"error": "worker not found"})
 		return
@@ -213,6 +234,104 @@ func (s *Server) cancelTask(c *gin.Context) {
 	// forward to worker so it can abort the thread
 	go s.pushCancelToWorker(id, req.TaskID)
 	c.JSON(200, gin.H{"ok": true})
+}
+
+// pauseTask flips a running task to "paused" on the store, then signals the
+// owning worker to set its pause_event so the subprocess blocks between
+// progress updates.
+func (s *Server) pauseTask(c *gin.Context) {
+	id := c.Param("id")
+	if !s.store.PauseTask(id) {
+		c.JSON(409, gin.H{"error": "task not running or not found"})
+		return
+	}
+	t := s.store.GetTask(id)
+	if t != nil && t.WorkerID != "" {
+		go s.pushControlToWorker(t.WorkerID, id, "pause")
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+// resumeTask flips a paused task back to running and signals the worker to
+// clear pause_event. StartedAt is shifted forward by the pause duration inside
+// ResumeTask so the timeout clock doesn't tick during pause.
+func (s *Server) resumeTask(c *gin.Context) {
+	id := c.Param("id")
+	if !s.store.ResumeTask(id) {
+		c.JSON(409, gin.H{"error": "task not paused or not found"})
+		return
+	}
+	t := s.store.GetTask(id)
+	if t != nil && t.WorkerID != "" {
+		go s.pushControlToWorker(t.WorkerID, id, "resume")
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+// stopTask hard-stops a task. Marks the task failed immediately so the dashboard
+// stops showing it as alive, then asks the worker to terminate its subprocess
+// (which may already be exiting in response to cancel_event being set).
+func (s *Server) stopTask(c *gin.Context) {
+	id := c.Param("id")
+	t := s.store.GetTask(id)
+	if t == nil {
+		c.JSON(404, gin.H{"error": "task not found"})
+		return
+	}
+	if !s.store.StopTask(id) {
+		c.JSON(409, gin.H{"error": "task already finished"})
+		return
+	}
+	if t.WorkerID != "" {
+		go s.pushControlToWorker(t.WorkerID, id, "stop")
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+// startTask resumes a paused task in place, OR clones a finished task and
+// dispatches a brand-new task with the same payload + requirements.
+func (s *Server) startTask(c *gin.Context) {
+	id := c.Param("id")
+	original := s.store.GetTask(id)
+	if original == nil {
+		c.JSON(404, gin.H{"error": "task not found"})
+		return
+	}
+	switch original.Status {
+	case "paused":
+		if !s.store.ResumeTask(id) {
+			c.JSON(409, gin.H{"error": "task not paused"})
+			return
+		}
+		if original.WorkerID != "" {
+			go s.pushControlToWorker(original.WorkerID, id, "resume")
+		}
+		c.JSON(200, gin.H{"ok": true, "task": original})
+	case "running":
+		// no-op, but tell the user it's already running
+		c.JSON(200, gin.H{"ok": true, "task": original, "noop": "already running"})
+	case "pending":
+		// re-dispatch in case scheduler hasn't picked it up yet
+		newTask, err := s.dispatchTaskWithParams(original.Type, original.Payload,
+			original.Source, original.Priority, original.MaxRetries,
+			original.TimeoutSecs, original.Requirements)
+		if err != nil {
+			c.JSON(503, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"ok": true, "task": newTask})
+	default: // done | failed
+		// Clone as a brand-new task. New ID, fresh CreatedAt, Retries=0.
+		newTask, err := s.dispatchTaskWithParams(original.Type, original.Payload,
+			original.Source, original.Priority, original.MaxRetries,
+			original.TimeoutSecs, original.Requirements)
+		if err != nil {
+			c.JSON(503, gin.H{"error": err.Error()})
+			return
+		}
+		Info("task restarted: original=%s new=%s type=%s", original.ID, newTask.ID, original.Type)
+		c.JSON(200, gin.H{"ok": true, "task": newTask})
+	}
 }
 
 type progressReq struct {
@@ -511,6 +630,28 @@ func (s *Server) pushCancelToWorker(workerID, taskID string) {
 	resp, err := workerHTTP.Do(req)
 	if err != nil {
 		Warn("cancel push failed worker=%s task=%s: %v", workerID, taskID, err)
+		return
+	}
+	defer resp.Body.Close()
+}
+
+// pushControlToWorker signals a worker to set / clear / kill its per-task
+// pause_event (action = "pause" | "resume" | "stop"). Best-effort — if the
+// worker is unreachable the gateway-side state is still authoritative.
+func (s *Server) pushControlToWorker(workerID, taskID, action string) {
+	w := s.store.GetWorker(workerID)
+	if w == nil {
+		return
+	}
+	url := fmt.Sprintf("http://%s:%d/task/%s", resolveWorkerHost(w), w.Port, action)
+	body, _ := json.Marshal(map[string]string{"task_id": taskID})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := workerHTTP.Do(req)
+	if err != nil {
+		Warn("control push failed worker=%s task=%s action=%s: %v", workerID, taskID, action, err)
 		return
 	}
 	defer resp.Body.Close()

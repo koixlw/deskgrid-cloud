@@ -70,11 +70,9 @@ func (h *Hub) HandleWS(w http.ResponseWriter, r *http.Request) {
 	h.clients[conn] = true
 	h.mu.Unlock()
 
-	// initial snapshot
-	snapshot := map[string]interface{}{
-		"workers": getStoreSnapshot(),
-	}
-	init := WSMessage{Event: "init", Payload: snapshot, Time: time.Now()}
+	// initial snapshot (workers + tasks + stats, top-level so the panel can
+	// pull each one out of payload.<key>).
+	init := WSMessage{Event: "init", Payload: getStoreSnapshot(), Time: time.Now()}
 	if data, err := json.Marshal(init); err == nil {
 		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		conn.WriteMessage(websocket.TextMessage, data)
@@ -96,10 +94,15 @@ func SetStoreRef(s *Store) { storeRef = s }
 
 func getStoreSnapshot() map[string]interface{} {
 	if storeRef == nil {
-		return map[string]interface{}{}
+		return map[string]interface{}{
+			"workers": []interface{}{},
+			"tasks":   []interface{}{},
+			"stats":   Stats{Completed: 0, Failed: 0},
+		}
 	}
 	return map[string]interface{}{
 		"workers": storeRef.ListWorkers(),
 		"tasks":   storeRef.ListTasks(),
+		"stats":   storeRef.StatsSnapshot(),
 	}
 }

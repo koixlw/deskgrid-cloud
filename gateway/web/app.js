@@ -228,6 +228,7 @@ function renderWorkers() {
     node.querySelector('.worker-cpu').textContent = `${w.cpu || '未知CPU'} · ${w.cores || 0}核 · ${formatMB(w.memory_mb)}`;
     setMeter(node.querySelector('.meter-cpu'), node.querySelector('.meter-cpu-v'), w.cpu_usage);
     setMeter(node.querySelector('.meter-mem'), node.querySelector('.meter-mem-v'), w.mem_usage);
+    renderWorkerGPUs(node.querySelector('.worker-gpus'), w.gpus);
     node.querySelector('.worker-queue').textContent = w.queue_len || 0;
     node.querySelector('.worker-done').textContent = w.tasks_done || 0;
     const delBtn = node.querySelector('.worker-delete');
@@ -266,6 +267,57 @@ function formatMB(mb) {
   if (!mb) return '?MB';
   if (mb >= 1024) return (mb / 1024).toFixed(1) + 'GB';
   return mb + 'MB';
+}
+
+// escapeHtml guards user-supplied strings (e.g. GPU model names from pynvml)
+// before they hit innerHTML. pynvml is unlikely to return malicious strings
+// but defence in depth is cheap here.
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// renderWorkerGPUs fills the .worker-gpus container with one .gpu-item per
+// card reported by the worker. Hides the container entirely on CPU-only hosts
+// (or workers that haven't reported GPUs yet).
+function renderWorkerGPUs(container, gpus) {
+  if (!gpus || gpus.length === 0) {
+    container.hidden = true;
+    container.innerHTML = '';
+    return;
+  }
+  container.hidden = false;
+  container.innerHTML = `
+    <div class="gpu-section-title">
+      <span class="gpu-section-label">🎮 GPU · ${gpus.length} 卡</span>
+    </div>
+  ` + gpus.map((g) => {
+    const memPct = g.mem_total_mb > 0
+      ? Math.max(0, Math.min(100, (g.mem_used_mb / g.mem_total_mb) * 100))
+      : 0;
+    const tempStr = g.temp_c > 0 ? `${g.temp_c}°C` : '';
+    // 温度颜色编码：< 60℃ 凉，60–80℃ 温，> 80℃ 热
+    const tempClass = g.temp_c > 0
+      ? (g.temp_c >= 80 ? 'temp-hot' : g.temp_c >= 60 ? 'temp-warm' : 'temp-cool')
+      : '';
+    return `
+      <div class="gpu-item">
+        <div class="gpu-head">
+          <span class="gpu-name">GPU ${g.index}: ${escapeHtml(g.name || 'unknown')}</span>
+          <span class="gpu-temp ${tempClass}">${escapeHtml(tempStr)}</span>
+        </div>
+        <div class="meter">
+          <span class="meter-label">显存</span>
+          <div class="meter-bar"><div class="meter-fill meter-gpu" style="width:${memPct.toFixed(1)}%"></div></div>
+          <span class="meter-value">${formatMB(g.mem_used_mb)} / ${formatMB(g.mem_total_mb)} · ${memPct.toFixed(0)}%</span>
+        </div>
+      </div>
+    `;
+  }).join('');
 }
 
 function renderTasks() {
@@ -332,40 +384,108 @@ function renderTasks() {
       else state.expanded.delete(t.id);
     });
 
-    // Cancel button: only enabled while pending/running, posts to
-    // gateway which forwards to the worker via pushCancelToWorker.
-    const cancelBtn = node.querySelector('.task-cancel');
-    const canCancel = t.status === 'pending' || t.status === 'running';
-    cancelBtn.disabled = !canCancel;
-    if (!canCancel) cancelBtn.title = '任务已结束，无需中断';
-    cancelBtn.addEventListener('click', async (ev) => {
+    // Action button state matrix — derived from current task.status.
+    //   pending: can stop (cancel + cleanup) or force-dispatch; no pause yet.
+    //   running: can pause (recoverable) or stop (force-terminate).
+    //   paused:  can resume via Start, or stop to give up.
+    //   done/failed: only Start (re-dispatch) makes sense.
+    const pauseBtn  = node.querySelector('.task-pause');
+    const stopBtn   = node.querySelector('.task-stop');
+    const startBtn  = node.querySelector('.task-start');
+    const deleteBtn = node.querySelector('.task-delete');
+
+    let canPause = false, canStop = false, canStart = false, startLabel = '▶ 开始';
+    if (t.status === 'running')      { canPause = true; canStop  = true; }
+    else if (t.status === 'paused')  {                canStop  = true; canStart = true; startLabel = '▶ 恢复'; }
+    else if (t.status === 'pending') {                canStop  = true; canStart = true; startLabel = '▶ 立即派发'; }
+    else if (t.status === 'done' || t.status === 'failed') { canStart = true; startLabel = '▶ 重跑'; }
+    pauseBtn.disabled  = !canPause;
+    stopBtn.disabled   = !canStop;
+    startBtn.disabled  = !canStart;
+    startBtn.textContent = startLabel;
+    pauseBtn.title = canPause ? '暂停任务（可恢复）' : '仅运行中可暂停';
+    stopBtn.title  = canStop  ? '终止任务（不可恢复）' : '任务已结束，无需停止';
+    startBtn.title = canStart ? startLabel.replace('▶ ', '') : '任务正在运行中';
+
+    // ---------- Pause ----------
+    pauseBtn.addEventListener('click', async (ev) => {
       ev.stopPropagation();
-      if (!t.worker_id) { alert('该任务尚未派发给 worker'); return; }
-      if (!confirm(`确认中断任务 ${t.id.slice(0, 8)} ？`)) return;
-      cancelBtn.disabled = true;
+      if (t.status !== 'running') return;
+      if (!confirm(`确认暂停任务 ${t.id.slice(0, 8)} ？\n\n可点 ▶ 开始 继续执行。`)) return;
+      pauseBtn.disabled = true;
       try {
-        const r = await authedFetch(`/api/workers/${t.worker_id}/task/cancel`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ task_id: t.id }),
-        });
+        const r = await authedFetch(`/api/tasks/${t.id}/pause`, { method: 'POST' });
         if (!r.ok) {
-          const msg = await r.text().catch(() => '');
-          alert(`中断失败 (${r.status}): ${msg || r.statusText}`);
-          cancelBtn.disabled = false;
+          const err = await r.json().catch(() => ({}));
+          alert(`暂停失败 (${r.status}): ${err.error || r.statusText}`);
+          pauseBtn.disabled = false;
         }
+        // success: gateway emits task_updated with status=paused; renderTasks
+        // will refresh the button matrix.
       } catch (e) {
-        alert(`中断失败: ${e}`);
-        cancelBtn.disabled = false;
+        alert(`暂停失败: ${e}`);
+        pauseBtn.disabled = false;
       }
     });
 
-    // Delete button: removes the task from gateway store. If the task
-    // is still running, the gateway also pushes a cancel to the worker.
-    const deleteBtn = node.querySelector('.task-delete');
+    // ---------- Stop ----------
+    stopBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (!(t.status === 'running' || t.status === 'paused' || t.status === 'pending')) return;
+      if (!confirm(`确认停止任务 ${t.id.slice(0, 8)} ？\n\n子进程将被强制终止，无法恢复。`)) return;
+      stopBtn.disabled = true;
+      try {
+        const r = await authedFetch(`/api/tasks/${t.id}/stop`, { method: 'POST' });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          alert(`停止失败 (${r.status}): ${err.error || r.statusText}`);
+          stopBtn.disabled = false;
+        }
+        // success → gateway emits task_done with status=failed; renderTasks
+        // will refresh and disable stop/start appropriately.
+      } catch (e) {
+        alert(`停止失败: ${e}`);
+        stopBtn.disabled = false;
+      }
+    });
+
+    // ---------- Start / Resume / Re-run ----------
+    startBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      const verb =
+        t.status === 'paused'      ? '恢复' :
+        t.status === 'pending'     ? '立即派发' :
+        t.status === 'done' || t.status === 'failed' ? '重跑' : '开始';
+      if (t.status !== 'paused') {
+        if (!confirm(`确认${verb}任务 ${t.id.slice(0, 8)} ？\n\n会派发为一条新任务。`)) return;
+      } else {
+        if (!confirm(`确认恢复任务 ${t.id.slice(0, 8)} ？`)) return;
+      }
+      startBtn.disabled = true;
+      try {
+        const r = await authedFetch(`/api/tasks/${t.id}/start`, { method: 'POST' });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          alert(`${verb}失败 (${r.status}): ${err.error || r.statusText}`);
+          startBtn.disabled = false;
+          return;
+        }
+        // success → gateway emits task_updated or new task_added; nothing else
+        // to do here. The panel refreshes via WebSocket.
+      } catch (e) {
+        alert(`${verb}失败: ${e}`);
+        startBtn.disabled = false;
+      }
+    });
+
+    // ---------- Delete ----------
+    // Removes the task from gateway store. If the task is still running /
+    // paused, the gateway also pushes a stop to the worker. (Old cancel is
+    // superseded by Stop button, but DELETE remains as "purge from list".)
     deleteBtn.addEventListener('click', async (ev) => {
       ev.stopPropagation();
-      const verb = canCancel ? '中断并删除' : '删除';
+      const isActive = t.status === 'pending' || t.status === 'running' || t.status === 'paused';
+      const verb = isActive ? '停止并删除' : '删除';
       if (!confirm(`确认${verb}任务 ${t.id.slice(0, 8)} ？此操作不可恢复。`)) return;
       deleteBtn.disabled = true;
       try {

@@ -3,6 +3,9 @@ bin/gateway.exe~
 build/
 deskgrid-worker.spec
 dist/deskgrid-worker.exe
+deskgrid-all.spec
+dist/deskgrid-all.exe
+dist.rar
 gateway/rsrc_*.syso
 gateway/winres/#*.ico
 

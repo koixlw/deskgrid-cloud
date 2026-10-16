@@ -173,8 +173,8 @@ html, body {
 }
 .worker-delete:disabled { opacity: 0.4; cursor: not-allowed; }
 
-/* Task action buttons (cancel + delete) — inline in .task-head */
-.task-cancel, .task-delete {
+/* Task action buttons (pause / stop / start / delete) — inline in .task-head */
+.task-pause, .task-stop, .task-start, .task-delete {
   background: transparent;
   border: 1px solid transparent;
   color: #8b949e;
@@ -186,17 +186,27 @@ html, body {
   transition: color 0.15s, border-color 0.15s, background 0.15s;
   font-family: inherit;
 }
-.task-cancel:hover:not(:disabled) {
-  color: #d29922;
-  border-color: #d29922;
-  background: rgba(210, 153, 34, 0.08);
+.task-pause:hover:not(:disabled) {
+  color: #58a6ff;
+  border-color: #58a6ff;
+  background: rgba(88, 166, 255, 0.08);
+}
+.task-stop:hover:not(:disabled) {
+  color: #f85149;
+  border-color: #f85149;
+  background: rgba(248, 81, 73, 0.08);
+}
+.task-start:hover:not(:disabled) {
+  color: #3fb950;
+  border-color: #3fb950;
+  background: rgba(63, 185, 80, 0.08);
 }
 .task-delete:hover:not(:disabled) {
   color: #f85149;
   border-color: #f85149;
   background: rgba(248, 81, 73, 0.08);
 }
-.task-cancel:disabled, .task-delete:disabled {
+.task-pause:disabled, .task-stop:disabled, .task-start:disabled, .task-delete:disabled {
   opacity: 0.3;
   cursor: not-allowed;
 }
@@ -267,6 +277,7 @@ html, body {
   overflow: hidden;
 }
 .task-item[data-status="running"] { border-color: #d29922; }
+.task-item[data-status="paused"]  { border-color: #58a6ff; }
 .task-item[data-status="done"] { border-color: #238636; }
 .task-item[data-status="failed"] { border-color: #f85149; }
 .task-head {
@@ -289,6 +300,7 @@ html, body {
   text-transform: uppercase;
 }
 .task-item[data-status="running"] .task-status { background: #d29922; }
+.task-item[data-status="paused"]  .task-status { background: #58a6ff; }
 .task-item[data-status="done"] .task-status { background: #238636; }
 .task-item[data-status="failed"] .task-status { background: #f85149; }
 .task-item[data-status="pending"] .task-status { background: #6e7681; }
@@ -437,6 +449,73 @@ html, body {
   font-size: 11px;
   color: #6e7681;
   font-style: italic;
+}
+
+/* ---------- GPU section on worker card ---------- */
+.worker-gpus {
+  margin-top: 8px;
+  padding: 8px;
+  background: rgba(110, 118, 129, 0.08);
+  border-radius: 6px;
+  border: 1px dashed rgba(110, 118, 129, 0.3);
+}
+.worker-gpus:empty {
+  display: none;
+}
+.gpu-section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #8b949e;
+  margin-bottom: 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px dashed rgba(110, 118, 129, 0.25);
+}
+.gpu-section-label {
+  letter-spacing: 0.3px;
+}
+.gpu-item + .gpu-item {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed rgba(110, 118, 129, 0.3);
+}
+.gpu-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+.gpu-name {
+  color: #c9d1d9;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-right: 8px;
+}
+.gpu-temp {
+  color: #8b949e;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(110, 118, 129, 0.15);
+}
+/* 温度颜色编码：凉 / 温 / 热 —— 让单卡状态一眼可读 */
+.gpu-temp.temp-cool { color: #3fb950; background: rgba(63, 185, 80, 0.12); }
+.gpu-temp.temp-warm { color: #d29922; background: rgba(210, 153, 34, 0.12); }
+.gpu-temp.temp-hot  { color: #f85149; background: rgba(248, 81, 73, 0.15); }
+/* Temperature color coding (inline JS keeps it simple rather than
+   branching on °C here). Reusing the meter palette keeps the card
+   visually cohesive. */
+.worker-gpus .meter-gpu {
+  background: linear-gradient(90deg, #8957e5, #58a6ff);
+}
+.worker-gpus .meter-bar {
+  /* narrower so the multi-card stack doesn't dominate the card */
+  height: 6px;
 }
 
 /* Mobile */

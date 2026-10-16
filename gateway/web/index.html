@@ -57,9 +57,10 @@
     <div class="task-filters">
       <button class="filter active" data-filter="all">全部</button>
       <button class="filter" data-filter="running">运行中</button>
+      <button class="filter" data-filter="paused">暂停中</button>
+      <button class="filter" data-filter="pending">等待中</button>
       <button class="filter" data-filter="done">已完成</button>
       <button class="filter" data-filter="failed">失败</button>
-      <button class="filter" data-filter="pending">等待中</button>
     </div>
     <div class="task-list" id="task-list">
       <div class="empty">暂无任务</div>
@@ -153,6 +154,10 @@
       <div class="meter-bar"><div class="meter-fill meter-mem"></div></div>
       <span class="meter-value meter-mem-v">0%</span>
     </div>
+    <!-- GPU section: hidden by default; renderWorkers() shows it
+         when this worker has reported at least one GPU. Populated
+         with one .gpu-item per card. -->
+    <div class="worker-gpus" hidden></div>
     <div class="worker-foot">
       <span>队列: <b class="worker-queue">0</b></span>
       <span>完成: <b class="worker-done">0</b></span>
@@ -166,7 +171,9 @@
       <span class="task-type"></span>
       <span class="task-status">pending</span>
       <span class="task-time"></span>
-      <button type="button" class="task-cancel" title="中断任务（仅在 running 时可用）">⏹ 中断</button>
+      <button type="button" class="task-pause"  title="暂停任务（可恢复）">⏸ 中断</button>
+      <button type="button" class="task-stop"   title="终止任务（不可恢复）">⏹ 停止</button>
+      <button type="button" class="task-start"  title="启动 / 恢复 / 重跑">▶ 开始</button>
       <button type="button" class="task-delete" title="从列表删除任务">✕ 删除</button>
       <span class="task-toggle">▾</span>
     </div>

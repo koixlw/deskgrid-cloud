@@ -60,8 +60,10 @@ func main() {
 	defer persistence.Stop()
 
 	// Restore previous state from disk, then settle in-flight tasks.
-	if workers, tasks, inFlight := internal.Load(dataDir); len(workers) > 0 || len(tasks) > 0 {
-		internal.Info("persistence: restored %d workers, %d tasks (%d in-flight)", len(workers), len(tasks), len(inFlight))
+	if workers, tasks, inFlight, savedStats := internal.Load(dataDir); len(workers) > 0 || len(tasks) > 0 || savedStats.Completed > 0 || savedStats.Failed > 0 {
+		internal.Info("persistence: restored %d workers, %d tasks (%d in-flight); stats completed=%d failed=%d",
+			len(workers), len(tasks), len(inFlight), savedStats.Completed, savedStats.Failed)
+		store.SetStats(savedStats)
 		for _, w := range workers {
 			store.AddWorker(w)
 		}
@@ -72,6 +74,8 @@ func main() {
 			store.AddTask(t)
 		}
 		for _, id := range inFlight {
+			// FailTaskDirect is intentional: in-flight tasks were counted in
+			// the prior session's stats, so we do NOT re-count them here.
 			store.FailTaskDirect(id, "gateway restarted; task was in-flight when gateway went down")
 		}
 	}

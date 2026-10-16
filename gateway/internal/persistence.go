@@ -11,10 +11,11 @@ import (
 // Persistence is a debounced JSON snapshot of the store. Subscribes to store
 // events and flushes full state to disk at most once per second.
 //
-// Two files written under <dir>:
+// Files written under <dir>:
 //
-//	workers.json - all workers
-//	tasks.json   - all tasks (last 50 logs each, to keep file size sane)
+//	workers.json   - all workers
+//	tasks.json     - all tasks (last 50 logs each, to keep file size sane)
+//	stats.json     - lifetime counters {completed, failed}
 type Persistence struct {
 	mu      sync.Mutex
 	dir     string
@@ -75,8 +76,10 @@ func (p *Persistence) flush() {
 	}
 	wb, _ := json.MarshalIndent(workers, "", "  ")
 	tb, _ := json.MarshalIndent(tasks, "", "  ")
+	sb, _ := json.MarshalIndent(p.store.StatsSnapshot(), "", "  ")
 	atomicWrite(filepath.Join(p.dir, "workers.json"), wb)
 	atomicWrite(filepath.Join(p.dir, "tasks.json"), tb)
+	atomicWrite(filepath.Join(p.dir, "stats.json"), sb)
 }
 
 func atomicWrite(path string, data []byte) error {
@@ -90,8 +93,11 @@ func atomicWrite(path string, data []byte) error {
 //
 // Returns workers + tasks that were saved + IDs of in-flight tasks (running or
 // pending) that the caller should mark as failed because their original worker
-// is unlikely to still be alive after gateway restart.
-func Load(dir string) (workers []*Worker, tasks []*Task, inFlight []string) {
+// is unlikely to still be alive after gateway restart. Also returns lifetime
+// Stats; if no stats.json exists yet but tasks.json has done/failed entries
+// (typical after upgrade), the Stats are backfilled from the task list so the
+// counters don't drop to zero after the upgrade.
+func Load(dir string) (workers []*Worker, tasks []*Task, inFlight []string, stats Stats) {
 	if data, err := os.ReadFile(filepath.Join(dir, "workers.json")); err == nil {
 		_ = json.Unmarshal(data, &workers)
 	}
@@ -100,6 +106,22 @@ func Load(dir string) (workers []*Worker, tasks []*Task, inFlight []string) {
 		for _, t := range tasks {
 			if t.Status == "running" || t.Status == "pending" {
 				inFlight = append(inFlight, t.ID)
+			}
+		}
+	}
+	statsPath := filepath.Join(dir, "stats.json")
+	if data, err := os.ReadFile(statsPath); err == nil {
+		_ = json.Unmarshal(data, &stats)
+	} else {
+		// Upgrade path: no stats.json yet, but tasks.json has historical
+		// done/failed entries. Derive from the task list so the KPI doesn't
+		// read 0 the first time the upgraded gateway starts.
+		for _, t := range tasks {
+			switch t.Status {
+			case "done":
+				stats.Completed++
+			case "failed":
+				stats.Failed++
 			}
 		}
 	}

@@ -5,6 +5,18 @@ import (
 	"time"
 )
 
+// GPUDetail is one GPU on a worker: model name, memory and temperature.
+// The (MemUsedMB, MemTotalMB) pair is fresh-sampled on every heartbeat so
+// the dashboard can show live usage; the model name is identified once at
+// register via pynvml and persisted with the worker record.
+type GPUDetail struct {
+	Index      int    `json:"index"`
+	Name       string `json:"name"`
+	MemUsedMB  int64  `json:"mem_used_mb"`
+	MemTotalMB int64  `json:"mem_total_mb"`
+	TempC      int    `json:"temp_c"`
+}
+
 // Worker represents a compute node registered with the gateway.
 type Worker struct {
 	ID            string    `json:"id"`
@@ -21,8 +33,10 @@ type Worker struct {
 	TasksDone     int       `json:"tasks_done"`
 	TasksFailed   int       `json:"tasks_failed"` // running count
 	Stability     float64   `json:"stability"`    // 1.0 = no failures, 0.5 = half failed
-	GPUMemUsedMB  int64     `json:"gpu_mem_used_mb"`
-	GPUMemTotalMB int64     `json:"gpu_mem_total_mb"`
+	GPUMemUsedMB  int64     `json:"gpu_mem_used_mb"`  // primary card (kept for the MinGPUFreeMB scheduler check)
+	GPUMemTotalMB int64     `json:"gpu_mem_total_mb"` // primary card
+	GPUCount      int       `json:"gpu_count,omitempty"`       // total GPUs detected (0 on a CPU host)
+	GPUs          []GPUDetail `json:"gpus,omitempty"`         // per-card detail (primary first); absent when no GPU
 	Host          string    `json:"host"`
 	Port          int       `json:"port"`
 	Capabilities  []string  `json:"capabilities,omitempty"` // self-reported: ["python","ffmpeg","model:sdxl",...]
@@ -40,12 +54,17 @@ type TaskRequirements struct {
 }
 
 // Task represents a unit of work dispatched to a worker.
+//
+// Status is one of: pending | running | paused | done | failed.
+// "paused" is a cooperative stop where the worker is still alive but has been
+// told to wait; the gateway tracks PausedAt so SweepTimeouts can subtract the
+// pause duration when comparing now - StartedAt.
 type Task struct {
 	ID           string           `json:"id"`
 	Type         string           `json:"type"`
 	Payload      string           `json:"payload"`
 	WorkerID     string           `json:"worker_id"`
-	Status       string           `json:"status"` // pending | running | done | failed
+	Status       string           `json:"status"` // pending | running | paused | done | failed
 	Progress     int              `json:"progress"`
 	Priority     int              `json:"priority"`    // higher = more important
 	MaxRetries   int              `json:"max_retries"` // 0 = no retry
@@ -53,6 +72,7 @@ type Task struct {
 	TimeoutSecs  int              `json:"timeout_secs"` // per-task timeout; 0 = use default
 	CreatedAt    time.Time        `json:"created_at"`
 	StartedAt    time.Time        `json:"started_at,omitempty"`
+	PausedAt     time.Time        `json:"paused_at,omitempty"`  // set when status flips to paused; cleared on resume
 	FinishedAt   time.Time        `json:"finished_at,omitempty"`
 	Result       string           `json:"result,omitempty"`
 	Error        string           `json:"error,omitempty"`
@@ -120,6 +140,12 @@ func (s *Store) AddWorker(w *Worker) {
 		existing.Host = w.Host
 		existing.Port = w.Port
 		existing.Capabilities = w.Capabilities
+		// GPU info: model name persists across re-registers (same hardware);
+		// memory + temp get refreshed on each heartbeat.
+		existing.GPUCount = w.GPUCount
+		existing.GPUs = w.GPUs
+		existing.GPUMemUsedMB = w.GPUMemUsedMB
+		existing.GPUMemTotalMB = w.GPUMemTotalMB
 		existing.LastSeen = time.Now()
 		existing.Status = "online"
 		// reset stability on re-register
@@ -140,7 +166,8 @@ func (s *Store) AddWorker(w *Worker) {
 	s.notify("worker_added", w)
 }
 
-func (s *Store) UpdateHeartbeat(id string, cpu, mem float64, queueLen int, gpuUsedMB int64, gpuTotalMB int64) *Worker {
+func (s *Store) UpdateHeartbeat(id string, cpu, mem float64, queueLen int,
+	gpuUsedMB int64, gpuTotalMB int64, gpus []GPUDetail) *Worker {
 	s.mu.Lock()
 	w, ok := s.workers[id]
 	if !ok {
@@ -152,6 +179,12 @@ func (s *Store) UpdateHeartbeat(id string, cpu, mem float64, queueLen int, gpuUs
 	w.QueueLen = queueLen
 	w.GPUMemUsedMB = gpuUsedMB
 	w.GPUMemTotalMB = gpuTotalMB
+	// Each heartbeat carries fresh per-card memory + temperature. We always
+	// overwrite so a hot-unplugged card stops appearing on the dashboard.
+	if gpus != nil {
+		w.GPUs = gpus
+		w.GPUCount = len(gpus)
+	}
 	w.LastSeen = time.Now()
 	if w.Status == "offline" {
 		w.Status = "online"
@@ -437,6 +470,116 @@ func (s *Store) CancelTask(taskID string) bool {
 	}
 	s.mu.Unlock()
 	return true
+}
+
+// PauseTask flips a running task to "paused" and records PausedAt so the
+// timeout sweeper can later subtract that duration from elapsed time.
+// Returns true if the task was running and is now paused.
+func (s *Store) PauseTask(taskID string) bool {
+	s.mu.Lock()
+	t, ok := s.tasks[taskID]
+	if !ok || t.Status != "running" {
+		s.mu.Unlock()
+		return false
+	}
+	t.Status = "paused"
+	t.PausedAt = time.Now()
+	tCopy := *t
+	tCopy.Logs = append([]string{}, t.Logs...)
+	s.mu.Unlock()
+	s.notify("task_updated", &tCopy)
+	return true
+}
+
+// ResumeTask flips a paused task back to running and shifts StartedAt forward
+// by the pause duration so SweepTimeouts / worker watchdog treat the task as if
+// it had just started. Returns true if the task was paused and is now running.
+func (s *Store) ResumeTask(taskID string) bool {
+	s.mu.Lock()
+	t, ok := s.tasks[taskID]
+	if !ok || t.Status != "paused" {
+		s.mu.Unlock()
+		return false
+	}
+	if !t.PausedAt.IsZero() {
+		t.StartedAt = t.StartedAt.Add(time.Since(t.PausedAt))
+	}
+	t.PausedAt = time.Time{}
+	t.Status = "running"
+	tCopy := *t
+	tCopy.Logs = append([]string{}, t.Logs...)
+	s.mu.Unlock()
+	s.notify("task_updated", &tCopy)
+	return true
+}
+
+// StopTask is a hard stop. It mirrors CancelTask (signals the worker to abort)
+// but ALSO directly flips the task to failed with "stopped by operator" — this
+// covers the case where the worker / subprocess is stuck and would not deliver a
+// failed result on its own. Safe to call on running or paused tasks.
+func (s *Store) StopTask(taskID string) bool {
+	s.mu.Lock()
+	t, ok := s.tasks[taskID]
+	if !ok || (t.Status != "running" && t.Status != "paused" && t.Status != "pending") {
+		s.mu.Unlock()
+		return false
+	}
+	wasWorked := t.Status
+	if t.cancelCh != nil {
+		close(t.cancelCh)
+		t.cancelCh = nil
+	}
+	t.Status = "failed"
+	t.Error = "stopped by operator"
+	t.FinishedAt = time.Now()
+	t.Progress = 100
+	wID := t.WorkerID
+	tCopy := *t
+	tCopy.Logs = append([]string{}, t.Logs...)
+	s.stats.Failed++
+	s.mu.Unlock()
+	_ = wasWorked
+	s.notify("task_done", &tCopy)
+	s.notify("stats_updated", s.StatsSnapshot())
+	if wID != "" {
+		s.RecordTaskResult(wID, false)
+	}
+	return true
+}
+
+// StartTask resumes a paused task in place, OR clones a finished task as a new
+// dispatch. Pending tasks get force-dispatched (scheduler bypass). Running
+// tasks return the task unchanged. Returns the task the user can observe — the
+// resumed one, a newly created one, or nil on error.
+func (s *Store) StartTask(taskID string) *Task {
+	s.mu.Lock()
+	t, ok := s.tasks[taskID]
+	if !ok {
+		s.mu.Unlock()
+		return nil
+	}
+	switch t.Status {
+	case "paused":
+		if !t.PausedAt.IsZero() {
+			t.StartedAt = t.StartedAt.Add(time.Since(t.PausedAt))
+		}
+		t.PausedAt = time.Time{}
+		t.Status = "running"
+		tCopy := *t
+		tCopy.Logs = append([]string{}, t.Logs...)
+		s.mu.Unlock()
+		s.notify("task_updated", &tCopy)
+		return &tCopy
+	case "running":
+		tCopy := *t
+		tCopy.Logs = append([]string{}, t.Logs...)
+		s.mu.Unlock()
+		return &tCopy
+	default:
+		// pending / done / failed → caller will clone + dispatch via Server
+		s.mu.Unlock()
+		return t
+	}
 }
 
 // GetTaskCancelCh returns the per-task cancellation channel for a worker to
