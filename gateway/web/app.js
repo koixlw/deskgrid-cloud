@@ -709,6 +709,143 @@ setInterval(async () => {
   }
 }, 10000);
 
+// ---------- Local-tasks panel (Phase 3) ----------
+//
+// Polls /api/local-tasks every 5s and renders one card per detected heavy
+// service / process. Clicking "扔到远端" opens a modal with the auto-
+// generated payload and dispatches via /api/local-tasks/:id/dispatch.
+const ltState = { items: new Map() };
+
+async function pollLocalTasks() {
+  try {
+    const r = await authedFetch('/api/local-tasks');
+    if (!r.ok) return;
+    const arr = await r.json();
+    ltState.items.clear();
+    if (Array.isArray(arr)) {
+      arr.forEach((t) => ltState.items.set(t.id, t));
+    }
+    renderLocalTasks();
+  } catch (e) { /* transient — next tick will retry */ }
+}
+
+function renderLocalTasks() {
+  const grid = $('#local-tasks-grid');
+  if (!grid) return;
+  const items = Array.from(ltState.items.values());
+  if (items.length === 0) {
+    grid.innerHTML = '<div class="empty">暂无可识别的本机任务</div>';
+    return;
+  }
+  // throwable first (map_to_type != ''), then busy, then by service name
+  items.sort((a, b) => {
+    const aT = !!a.map_to_type, bT = !!b.map_to_type;
+    if (aT !== bT) return aT ? -1 : 1;
+    if ((a.status === 'busy') !== (b.status === 'busy')) {
+      return a.status === 'busy' ? -1 : 1;
+    }
+    return (a.service || '').localeCompare(b.service || '');
+  });
+  const tpl = $('#local-task-card-tpl');
+  if (!tpl) return;
+  grid.innerHTML = '';
+  items.forEach((lt) => {
+    const node = tpl.content.firstElementChild.cloneNode(true);
+    node.dataset.status = lt.status || 'unknown';
+    node.querySelector('.local-task-name').textContent = lt.title || lt.service || 'unknown';
+    const typeBadge = node.querySelector('.local-task-type-badge');
+    typeBadge.textContent = lt.map_to_type || '不可映射';
+    node.querySelector('.local-task-status').textContent = lt.status || 'unknown';
+    const meta = node.querySelector('.local-task-meta');
+    if (lt.port) {
+      const hostEl = meta.querySelector('[data-field="host"]');
+      hostEl.textContent = `:${lt.port}`;
+      hostEl.hidden = false;
+    }
+    if (lt.pid) {
+      const pidEl = meta.querySelector('[data-field="pid"]');
+      pidEl.textContent = `pid ${lt.pid}`;
+      pidEl.hidden = false;
+    }
+    node.querySelector('.local-task-suggest-type').textContent = lt.map_to_type || '未匹配';
+    const btn = node.querySelector('.local-task-action');
+    const throwable = !!lt.map_to_type && lt.status !== 'idle';
+    btn.disabled = !throwable;
+    btn.title = throwable
+      ? '将该任务复制派发给远端空闲 worker；本机任务保持继续运行'
+      : '当前状态不可派发（无映射类型或服务空闲）';
+    btn.addEventListener('click', () => openLocalTaskModal(lt));
+    grid.appendChild(node);
+  });
+}
+
+function openLocalTaskModal(lt) {
+  if (!lt.map_to_type) return;
+  $('#ltm-type').value = lt.map_to_type;
+  $('#ltm-payload').value = lt.payload_tpl || '';
+  const hint = lt.port ? `:${lt.port}` : '';
+  const pidHint = lt.pid ? `pid ${lt.pid}` : '';
+  $('#ltm-hint').textContent =
+    `服务: ${lt.service}${hint ? ' · ' + hint : ''}${pidHint ? ' · ' + pidHint : ''}`;
+  const dlg = $('#local-task-modal');
+  if (!dlg) return;
+  dlg.returnValue = '';
+  // submit-on-close handler: runs once when the dialog closes with returnValue='submit'
+  const onClose = async () => {
+    dlg.removeEventListener('close', onClose);
+    if (dlg.returnValue !== 'submit') return;
+    const payload = $('#ltm-payload').value.trim();
+    if (!payload) { alert('Payload 不能为空'); return; }
+    const submit = $('#ltm-submit');
+    submit.disabled = true;
+    submit.textContent = '下发中...';
+    try {
+      const r = await authedFetch(`/api/local-tasks/${lt.id}/dispatch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ overrides: { payload } }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        alert('派发失败 (' + r.status + '): ' + (err.error || r.statusText));
+      } else {
+        const task = await r.json();
+        const wid = task.worker_id ? task.worker_id.slice(0, 8) : '?';
+        alert(`已派发为远端任务 #${task.id.slice(0, 8)} (worker: ${wid})`);
+        // The task_added WS event will refresh the task list automatically.
+      }
+    } catch (e) {
+      alert('请求失败: ' + e.message);
+    } finally {
+      submit.disabled = false;
+      submit.textContent = '下发到最优节点';
+    }
+  };
+  dlg.addEventListener('close', onClose);
+  dlg.showModal();
+}
+
+// Wire up dialog buttons (the modal lives in index.html, outside the boot flow).
+const ltmCancel = $('#ltm-cancel');
+if (ltmCancel) ltmCancel.addEventListener('click', () => $('#local-task-modal').close());
+const ltmForm = $('#local-task-form');
+if (ltmForm) ltmForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  $('#local-task-modal').close('submit');
+});
+const ltRefresh = $('#local-tasks-refresh');
+if (ltRefresh) ltRefresh.addEventListener('click', async () => {
+  ltRefresh.disabled = true;
+  try { await authedFetch('/api/local-tasks/scan', { method: 'POST' }); }
+  catch (e) { /* ignore */ }
+  ltRefresh.disabled = false;
+  await pollLocalTasks();
+});
+
+// 5s polling — keeps the panel responsive without adding a new WS event type.
+pollLocalTasks();
+setInterval(pollLocalTasks, 5000);
+
 // ---------- Boot ----------
 (async function () {
   await initAuth();

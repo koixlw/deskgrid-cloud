@@ -15,6 +15,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+
+	"deskgrid-cloud-gateway/internal/localtasks"
 )
 
 // Server wires HTTP routes to the store + hub.
@@ -25,6 +27,7 @@ type Server struct {
 	authRequired bool
 	hmacSecret   []byte
 	peers        *PeerSync
+	ltReg        *localtasks.Registry // nil until StartLocalTaskScanner is called
 }
 
 func NewServer(store *Store, hub *Hub, token string) *Server {
@@ -107,6 +110,14 @@ func (s *Server) routes() {
 		api.POST("/tasks/:id/resume", bodyLimit(1024), s.resumeTask)
 		api.POST("/tasks/:id/stop", bodyLimit(1024), s.stopTask)
 		api.POST("/tasks/:id/start", bodyLimit(1024), s.startTask)
+
+		// Local-task offload: scan the gateway host for heavy services
+		// (ComfyUI / SD WebUI / Ollama / ffmpeg / blender / custom) and
+		// dispatch a copy of one to a remote worker. See internal/localtasks.
+		api.GET("/local-tasks", s.listLocalTasks)
+		api.POST("/local-tasks/scan", bodyLimit(4*1024), s.scanLocalTasksNow)
+		api.POST("/local-tasks/:id/dispatch", bodyLimit(16*1024), s.dispatchLocalTask)
+		api.POST("/local-tasks/reload", bodyLimit(4*1024), s.reloadLocalTasksConfig)
 
 		// peer-to-peer replication endpoint (gateway-to-gateway only,
 		// not auth-protected because it sits on internal network)
@@ -763,3 +774,155 @@ func (s *Server) listModels(c *gin.Context) {
 
 // Keep imports referenced
 var _ = strings.TrimSpace
+
+// ---------- Local-task offload (Phase 3) ----------
+//
+// Scans the gateway host for heavy services (ComfyUI / SD WebUI / Ollama /
+// ffmpeg / blender / custom YAML rules). Each detected entity becomes a
+// LocalTask that the operator can dispatch a copy of to a remote worker.
+// The local task itself is NEVER touched — the dispatch is parallel and
+// independent.
+
+// StartLocalTaskScanner wires the localtasks.Registry into the server and
+// launches the background scan loop. Safe to call once at startup; calling
+// it twice would leak the previous ticker. The interval is read from the
+// GATEWAY_LOCALTASKS_INTERVAL env var (default 10s) but can be overridden
+// by passing a non-zero interval.
+//
+// cfgPath may be "" to disable YAML-driven custom rules entirely.
+func (s *Server) StartLocalTaskScanner(ctx context.Context, cfgPath string, interval time.Duration) {
+	if s.ltReg != nil {
+		return
+	}
+	if interval <= 0 {
+		if v := os.Getenv("GATEWAY_LOCALTASKS_INTERVAL"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil {
+				interval = d
+			}
+		}
+	}
+	s.ltReg = localtasks.NewRegistry(cfgPath, interval)
+	s.ltReg.Start(ctx)
+	Info("local-task scanner ENABLED (interval=%s, config=%s)", interval, cfgPath)
+}
+
+// LocalTaskRegistry exposes the registry so main.go can query it (currently
+// unused but kept for future hot-reload / health endpoints).
+func (s *Server) LocalTaskRegistry() *localtasks.Registry { return s.ltReg }
+
+// listLocalTasks — GET /api/local-tasks
+//
+// Returns the current snapshot sorted by (throwable, busy, service). An
+// empty slice (not null) is returned when nothing is detected, so the UI's
+// .empty placeholder renders correctly.
+func (s *Server) listLocalTasks(c *gin.Context) {
+	if s.ltReg == nil {
+		c.JSON(200, []localtasks.LocalTask{})
+		return
+	}
+	snap := s.ltReg.Snapshot()
+	if snap == nil {
+		snap = []localtasks.LocalTask{}
+	}
+	c.JSON(200, snap)
+}
+
+// scanLocalTasksNow — POST /api/local-tasks/scan
+//
+// Forces an immediate rescan (without waiting for the ticker) and returns
+// the fresh snapshot. Used by the UI's "手动扫描" button.
+func (s *Server) scanLocalTasksNow(c *gin.Context) {
+	if s.ltReg == nil {
+		c.JSON(503, gin.H{"error": "local-task scanner not enabled"})
+		return
+	}
+	if err := s.ltReg.Scan(c.Request.Context()); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	snap := s.ltReg.Snapshot()
+	if snap == nil {
+		snap = []localtasks.LocalTask{}
+	}
+	c.JSON(200, gin.H{"ok": true, "tasks": snap})
+}
+
+// dispatchLocalReq is the body shape for POST /api/local-tasks/:id/dispatch.
+// All fields are optional — defaults come from the cached LocalTask.
+type dispatchLocalReq struct {
+	Overrides *struct {
+		Payload      string           `json:"payload,omitempty"`
+		Requirements TaskRequirements `json:"requirements,omitempty"`
+		Priority     int              `json:"priority,omitempty"`
+		MaxRetries   int              `json:"max_retries,omitempty"`
+		TimeoutSecs  int              `json:"timeout_secs,omitempty"`
+	} `json:"overrides,omitempty"`
+}
+
+// dispatchLocalTask — POST /api/local-tasks/:id/dispatch
+//
+// Looks up the LocalTask by id, applies any overrides, then re-enters the
+// regular dispatch path. The "local-offload" source tag is stamped on the
+// resulting Task so audit trails can distinguish these from panel/openai
+// dispatches.
+func (s *Server) dispatchLocalTask(c *gin.Context) {
+	if s.ltReg == nil {
+		c.JSON(503, gin.H{"error": "local-task scanner not enabled"})
+		return
+	}
+	id := c.Param("id")
+	lt, ok := s.ltReg.Get(id)
+	if !ok {
+		c.JSON(404, gin.H{"error": "local task not found (may have stopped)"})
+		return
+	}
+
+	var req dispatchLocalReq
+	// body is optional — bind best-effort
+	_ = c.ShouldBindJSON(&req)
+
+	payload := lt.PayloadTpl
+	prio, retries, timeout := 0, 0, 0
+	var reqs TaskRequirements
+	if req.Overrides != nil {
+		if req.Overrides.Payload != "" {
+			payload = req.Overrides.Payload
+		}
+		if req.Overrides.Priority > 0 {
+			prio = req.Overrides.Priority
+		}
+		if req.Overrides.MaxRetries > 0 {
+			retries = req.Overrides.MaxRetries
+		}
+		if req.Overrides.TimeoutSecs > 0 {
+			timeout = req.Overrides.TimeoutSecs
+		}
+		reqs = req.Overrides.Requirements
+	}
+
+	task, err := s.dispatchTaskWithParams(
+		lt.MapToType, payload, "local-offload",
+		prio, retries, timeout, reqs,
+	)
+	if err != nil {
+		// dispatchTaskWithParams already returns a formatted error; bubble it up.
+		c.JSON(503, gin.H{"error": err.Error()})
+		return
+	}
+	Info("local-offload: localtask=%s → task=%s type=%s worker=%s",
+		lt.ID, task.ID, task.Type, task.WorkerID)
+	c.JSON(200, task)
+}
+
+// reloadLocalTasksConfig — POST /api/local-tasks/reload
+//
+// Hot-reloads the YAML config. Active scans in flight keep their loaded
+// rules; the next scan picks up the new ones.
+func (s *Server) reloadLocalTasksConfig(c *gin.Context) {
+	if s.ltReg == nil {
+		c.JSON(503, gin.H{"error": "local-task scanner not enabled"})
+		return
+	}
+	s.ltReg.Reload()
+	c.JSON(200, gin.H{"ok": true, "tasks": len(s.ltReg.Snapshot())})
+}

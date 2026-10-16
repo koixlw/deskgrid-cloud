@@ -53,6 +53,17 @@
   </section>
 
   <section class="panel">
+    <h2>🖥️ 本机重型任务</h2>
+    <div class="local-tasks-bar">
+      <span class="local-tasks-hint">网关自动识别本机的重任务；点「扔到远端」会把一份拷贝并行派发给空闲 worker — 本机任务不会被中断</span>
+      <button class="btn-secondary" id="local-tasks-refresh" type="button">手动扫描</button>
+    </div>
+    <div class="grid" id="local-tasks-grid">
+      <div class="empty">暂无可识别的本机任务</div>
+    </div>
+  </section>
+
+  <section class="panel">
     <h2>📋 任务列表</h2>
     <div class="task-filters">
       <button class="filter active" data-filter="all">全部</button>
@@ -201,6 +212,45 @@
     </div>
   </div>
 </template>
+
+<template id="local-task-card-tpl">
+  <div class="local-task-card" data-status="unknown">
+    <div class="local-task-head">
+      <span class="local-task-name"></span>
+      <span class="local-task-type-badge">不可映射</span>
+      <span class="local-task-status">unknown</span>
+    </div>
+    <div class="local-task-body">
+      <div class="local-task-meta">
+        <span data-field="host" hidden></span>
+        <span data-field="pid"  hidden></span>
+      </div>
+      <div class="local-task-suggested">建议映射: <code class="local-task-suggest-type">未匹配</code></div>
+    </div>
+    <div class="local-task-foot">
+      <button class="local-task-action" type="button" title="将本任务复制一份派发给远端空闲 worker">扔到远端</button>
+    </div>
+  </div>
+</template>
+
+<dialog id="local-task-modal" class="local-task-modal">
+  <form method="dialog" id="local-task-form">
+    <h3 id="local-task-modal-title">派发本机任务</h3>
+    <div class="form-row">
+      <label>任务类型</label>
+      <input type="text" id="ltm-type" readonly>
+    </div>
+    <div class="form-row">
+      <label>Payload (可编辑)</label>
+      <textarea id="ltm-payload" rows="8"></textarea>
+    </div>
+    <div class="form-actions">
+      <button type="button" class="btn-secondary" id="ltm-cancel">取消</button>
+      <button type="submit" class="btn-primary" id="ltm-submit">下发到最优节点</button>
+    </div>
+    <div class="form-hint" id="ltm-hint"></div>
+  </form>
+</dialog>
 
 <script src="/static/app.js"></script>
 </body>

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"embed"
 	"io/fs"
@@ -83,6 +84,13 @@ func main() {
 
 	srv := internal.NewServer(store, hub, token)
 	engine := srv.Engine()
+
+	// Local-task scanner: detects ComfyUI/SD/Ollama/ffmpeg/blender running
+	// on this host so the operator can dispatch a copy to a remote worker.
+	// Disabled by passing "" for cfgPath. Interval is read from
+	// GATEWAY_LOCALTASKS_INTERVAL (default 10s).
+	ltCfg := envOr("GATEWAY_LOCALTASKS_CONFIG", "localtasks.yaml")
+	srv.StartLocalTaskScanner(context.Background(), ltCfg, 0)
 
 	// Timeout sweeper dispatches retries via the server's helper.
 	store.StartTimeoutSweeper(15*time.Second, srv.DispatchRetryWithID)

@@ -1,0 +1,33 @@
+# deskgrid-cloud · local-tasks scanner config
+#
+# Defines CUSTOM rules in addition to the built-in probes (ComfyUI:8188,
+# SD WebUI:7860, Ollama:11434, ffmpeg.exe, blender.exe). The gateway reads
+# this file on startup and on POST /api/local-tasks/reload.
+#
+# Two rule shapes:
+#
+#   1) name_pattern:  match a process name substring (Windows: without .exe)
+#                     and dispatch the listed type with the templated
+#                     payload. {{pid}} {{name}} {{cmdline}} are substituted.
+#
+#   2) port:          probe a TCP port and dispatch on hit; useful for
+#                     services running on non-default ports.
+#
+# Missing file = no custom rules (built-in probes still work). Bad rule =
+# skipped silently at scan time.
+
+rules:
+  # Example: a custom product-listing tool. When ProductLister.exe is
+  # running on the gateway host, the panel shows a card; clicking
+  # "扔到远端" dispatches an exec_run on a worker that has the same exe.
+  - name: product-lister
+    name_pattern: "ProductLister"
+    type: "exec_run"
+    payload_template: 'C:/tools/product-lister.exe --queue {{pid}}'
+
+  # Example: a non-default-port ComfyUI on the same host. Skips the
+  # built-in :8188 probe and uses this one.
+  - name: alt-comfyui
+    port: 8189
+    type: "image_txt2img"
+    payload_template: '{"prompt": "port-8189 service stub"}'
